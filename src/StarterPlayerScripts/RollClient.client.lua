@@ -50,22 +50,28 @@ local FOOTSTEP_MIN_SCALE = 10 -- characters this big (or bigger) shake the groun
 local SHOCKWAVE_MIN_SCALE = 150 -- god tiers send a shockwave ring out on every footstep
 local STOMP_MIN_SCALE = 50 -- F key / STOMP button
 local VIEWPORT_MIN_SCALE = 10 -- V key / VIEW button
-local MAX_CAMERA_ZOOM = 3000
+local MIN_CAMERA_ZOOM = 30 -- max zoom at 1x
+local MAX_CAMERA_ZOOM = 2500
+local HIGH_TIER_MIN_SCALE = 35 -- Colossus and up get the cinematic reveal sound
 
--- Sound effects: Roblox built-ins (rbxasset://) and Roblox-licensed
--- APM Music / Pro Sound Effects audio. Empty string = no sound.
+-- Sound effects: Roblox UI sounds and Roblox-licensed Pro Sound Effects /
+-- APM Music audio. Empty string = no sound.
 local SOUNDS = {
-	tick = "rbxasset://sounds/clickfast.wav", -- each step of the roll spin and the Growth Spinner
-	reveal = "rbxasset://sounds/electronicpingshort.wav", -- normal result
-	rare = "rbxassetid://1840076509", -- rare reveal / server announcement (APM "Through the Roof" sting)
-	click = "rbxasset://sounds/button.wav", -- UI buttons
-	footstep = "rbxassetid://9116908541", -- giant footsteps (Pro Sound Effects deep impact)
+	tick = "rbxassetid://15675059323", -- each step of the roll spin and the Growth Spinner (Roblox UI bright click)
+	reveal = "rbxassetid://9114619050", -- normal result (Pro Sound Effects glass tinks)
+	rare = "rbxassetid://9114618734", -- rare reveal / server announcement (Pro Sound Effects glass tinks)
+	drop = "rbxassetid://9126009582", -- Colossus+ reveal: sub-bass drop (Pro Sound Effects subwoofer impact)
+	riser = "rbxassetid://9113122722", -- Colossus+ reveal: shimmer on top (Pro Sound Effects angel sparkle)
+	click = "rbxassetid://15675059323", -- UI buttons (Roblox UI bright click)
+	footstep = "rbxassetid://9126009589", -- giant footsteps (Pro Sound Effects subwoofer impact, pitched down + reverb)
 	stomp = "rbxassetid://1841351403", -- Ground Shaker Stomp (APM metal crash hit)
 	launch = "rbxassetid://9113840530", -- Wind Launcher whoosh (Pro Sound Effects)
 }
--- Background music: Roblox-licensed APM tracks, played in order on a loop.
-local MUSIC = { "rbxassetid://9046862941", "rbxassetid://9046863253", "rbxassetid://9043225696" }
-local MUSIC_VOLUME = 0.3
+-- Sounds that get a reverb tail in the world.
+local REVERB_SOUNDS = { footstep = true, stomp = true }
+-- Background music: Roblox-licensed anime lo-fi tracks (DistroKid), played in order on a loop.
+local MUSIC = { "rbxassetid://136995974791747", "rbxassetid://89791562526654" }
+local MUSIC_VOLUME = 0.15
 
 -- The player's SETTINGS (loaded from their save, see AUDIO & SETTINGS).
 local settings = { music = true, sfx = true, lowGfx = false }
@@ -103,7 +109,7 @@ local function tween(obj, time, props, style, direction)
 end
 
 local soundCache = {}
-local function playSound(name)
+local function playSound(name, volume, speed)
 	local id = SOUNDS[name]
 	if not id or id == "" or not settings.sfx then
 		return
@@ -113,6 +119,8 @@ local function playSound(name)
 		sound = make("Sound", { SoundId = id, Parent = SoundService })
 		soundCache[name] = sound
 	end
+	sound.Volume = volume or 0.5
+	sound.PlaybackSpeed = speed or 1
 	SoundService:PlayLocalSound(sound)
 end
 
@@ -130,6 +138,9 @@ local function play3D(name, parent, volume, speed, rollMin, rollMax)
 		RollOffMaxDistance = rollMax,
 		Parent = parent,
 	})
+	if REVERB_SOUNDS[name] then
+		make("ReverbSoundEffect", { DecayTime = 2.5, Density = 1, Diffusion = 1, DryLevel = 0, WetLevel = -4, Parent = sound })
+	end
 	sound:Play()
 	task.delay(6, sound.Destroy, sound)
 end
@@ -367,12 +378,23 @@ local function zoomFor(scale)
 	return math.clamp(12.5 * scale, 0.6, 2500)
 end
 
--- Giants can zoom far out (up to MAX_CAMERA_ZOOM) and can't zoom in so close
--- that the camera ends up inside their own head or torso.
+-- Max zoom grows with size (30 at 1x, ~1600 at World Eater) and giants
+-- can't zoom in so close that the camera ends up inside their own head or torso.
 local function cameraLimits(scale)
-	local maxZoom = math.clamp(30 * scale, 128, MAX_CAMERA_ZOOM)
+	local maxZoom = math.clamp(MIN_CAMERA_ZOOM * scale ^ 0.75, MIN_CAMERA_ZOOM, MAX_CAMERA_ZOOM)
 	local minZoom = scale >= 2 and 2.5 * scale or 0.5 -- normal-sized players keep first person
 	return math.min(minZoom, maxZoom), maxZoom
+end
+
+-- Giants: aim the camera above and a little behind the head, so their own
+-- torso sits low and small instead of filling the middle of the screen.
+-- (shake() adds its wobble on top of this.)
+local cameraBaseOffset = Vector3.zero
+local function giantCameraOffset(scale)
+	if scale < 2 then
+		return Vector3.zero
+	end
+	return Vector3.new(0, 0.8 * scale, 1 * scale)
 end
 
 local function applyCamera(snap)
@@ -380,6 +402,11 @@ local function applyCamera(snap)
 	local minZoom, maxZoom = cameraLimits(scale)
 	player.CameraMaxZoomDistance = maxZoom
 	player.CameraMinZoomDistance = minZoom
+	cameraBaseOffset = giantCameraOffset(scale)
+	local humanoid = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+	if humanoid then
+		humanoid.CameraOffset = cameraBaseOffset
+	end
 	if snap then
 		-- Trick: pin min and max to the same value for a moment to force the zoom.
 		local target = math.clamp(zoomFor(scale), minZoom, maxZoom)
@@ -470,12 +497,12 @@ local function shake(duration, strength)
 	connection = RunService.RenderStepped:Connect(function()
 		local t = os.clock() - start
 		if t >= duration or not humanoid.Parent then
-			humanoid.CameraOffset = Vector3.zero
+			humanoid.CameraOffset = cameraBaseOffset
 			connection:Disconnect()
 			return
 		end
 		local fade = 1 - t / duration
-		humanoid.CameraOffset = Vector3.new(
+		humanoid.CameraOffset = cameraBaseOffset + Vector3.new(
 			(math.random() - 0.5) * amount * fade,
 			(math.random() - 0.5) * amount * fade,
 			(math.random() - 0.5) * amount * fade
@@ -696,7 +723,7 @@ RunService.Heartbeat:Connect(function(dt)
 				local distance = (root.Position - myRoot.Position).Magnitude
 				if distance < range then
 					local closeness = 1 - distance / range
-					play3D("footstep", root, 0.5 + 0.5 * closeness, math.clamp(0.9 - scale / 400, 0.4, 0.9), scale * 2, range)
+					play3D("footstep", root, 0.6 + 0.6 * closeness, math.clamp(0.75 - scale / 500, 0.45, 0.75), scale * 2, range)
 					shake(0.25, 0.35 * closeness)
 				end
 			end
@@ -744,7 +771,7 @@ local function spin(duration)
 		nameLabel.Text = Tiers[id].name:upper()
 		nameLabel.TextColor3 = Tiers[id].color
 		pop(1.12, 0.08)
-		playSound("tick")
+		playSound("tick", 0.4, 1.1 + math.random() * 0.15)
 		task.wait(math.min(step, duration - (os.clock() - start)))
 		step *= 1.2 -- slow down like a wheel
 	end
@@ -771,15 +798,20 @@ local function reveal(tierId, scale, isNewBest, essence)
 	newBestLabel:FindFirstChildOfClass("UIStroke").Transparency = showNewBest and 0 or 1
 
 	pop(0.3, 0.4)
-	if rarity >= BIG_REVEAL_ONE_IN then
+	if tier.scale >= HIGH_TIER_MIN_SCALE then
 		doFlash(tier.color)
 		shake(0.7, 1.2)
-		playSound("rare")
+		playSound("drop", 1, 0.85)
+		playSound("riser", 0.6)
+	elseif rarity >= BIG_REVEAL_ONE_IN then
+		doFlash(tier.color)
+		shake(0.7, 1.2)
+		playSound("rare", 0.7)
 	elseif rarity >= SMALL_REVEAL_ONE_IN then
 		shake(0.3, 0.4)
-		playSound("reveal")
+		playSound("reveal", 0.55)
 	else
-		playSound("reveal")
+		playSound("reveal", 0.45)
 	end
 
 	local myToken = popupToken
@@ -1690,7 +1722,7 @@ end)
 local function hookClick(obj)
 	if obj:IsA("GuiButton") then
 		obj.Activated:Connect(function()
-			playSound("click")
+			playSound("click", 0.35)
 		end)
 	end
 end
@@ -1731,7 +1763,7 @@ announce.OnClientEvent:Connect(function(displayName, tierId, scale)
 	tween(banner, 0.4, { Position = UDim2.new(0.5, 0, 0, 56) }, Enum.EasingStyle.Back)
 	postToChat(text)
 	if displayName ~= player.DisplayName then
-		playSound("rare")
+		playSound("rare", 0.5)
 	end
 
 	task.delay(4, function()
