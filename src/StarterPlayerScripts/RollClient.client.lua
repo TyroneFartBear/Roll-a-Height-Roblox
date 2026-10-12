@@ -14,6 +14,7 @@ local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
 local TextChatService = game:GetService("TextChatService")
 local SoundService = game:GetService("SoundService")
+local HttpService = game:GetService("HttpService") -- only for JSONDecode, no web requests
 
 local RarityTable = require(ReplicatedStorage:WaitForChild("RarityTable"))
 local Tiers = RarityTable.Tiers
@@ -24,6 +25,7 @@ local rollResult = remotes:WaitForChild("RollResult")
 local announce = remotes:WaitForChild("Announce")
 local equipBest = remotes:WaitForChild("EquipBest")
 local devForceRoll = remotes:WaitForChild("DevForceRoll")
+local equipTier = remotes:WaitForChild("EquipTier")
 
 local player = Players.LocalPlayer
 
@@ -589,21 +591,199 @@ end)
 ---------------------------------------------------------------------
 -- LUCK BADGE
 ---------------------------------------------------------------------
+local function formatLuck(luck)
+	-- 1.0x, 1.2x, 1.35x
+	return (("%.2f"):format(luck):gsub("0$", "")) .. "x"
+end
+
 local function refreshLuck()
-	local boost = player:GetAttribute("FriendBoost") or 0
-	local luck = (player:GetAttribute("Luck") or 1) + boost
-	local pct = math.floor(boost * 100 + 0.5)
-	if pct > 0 then
-		luckLabel.Text = ("Luck: %.1fx  •  Friend Boost +%d%%"):format(luck, pct)
-		luckLabel.TextColor3 = Color3.fromRGB(120, 255, 150)
-	else
-		luckLabel.Text = ("Luck: %.1fx"):format(luck)
-		luckLabel.TextColor3 = Color3.new(1, 1, 1)
+	local friend = player:GetAttribute("FriendBoost") or 0
+	local group = player:GetAttribute("GroupBoost") or 0
+	local luck = (player:GetAttribute("Luck") or 1) + friend + group
+	local friendPct = math.floor(friend * 100 + 0.5)
+	local groupPct = math.floor(group * 100 + 0.5)
+	local parts = { "Luck: " .. formatLuck(luck) }
+	if friendPct > 0 then
+		table.insert(parts, ("Friend Boost +%d%%"):format(friendPct))
 	end
+	if groupPct > 0 then
+		table.insert(parts, ("Group Member +%d%%"):format(groupPct))
+	end
+	luckLabel.Text = table.concat(parts, "  •  ")
+	luckLabel.TextColor3 = (friendPct + groupPct > 0) and Color3.fromRGB(120, 255, 150) or Color3.new(1, 1, 1)
 end
 player:GetAttributeChangedSignal("FriendBoost"):Connect(refreshLuck)
+player:GetAttributeChangedSignal("GroupBoost"):Connect(refreshLuck)
 player:GetAttributeChangedSignal("Luck"):Connect(refreshLuck)
 refreshLuck()
+
+---------------------------------------------------------------------
+-- INDEX: every tier, shown as "???" until you've rolled it
+---------------------------------------------------------------------
+local indexButton = make("TextButton", {
+	AnchorPoint = Vector2.new(0, 0.5),
+	Position = UDim2.new(0, 12, 0.5, 0),
+	Size = UDim2.new(0, 96, 0, 44),
+	BackgroundColor3 = Color3.fromRGB(40, 150, 230),
+	Font = FONT,
+	Text = "INDEX",
+	TextColor3 = Color3.new(1, 1, 1),
+	TextSize = 22,
+	Parent = gui,
+}, { corner(12), stroke(3, Color3.fromRGB(15, 50, 90)) })
+
+local indexPanel = make("Frame", {
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Position = UDim2.fromScale(0.5, 0.45),
+	Size = UDim2.fromScale(0.9, 0.7),
+	BackgroundColor3 = Color3.fromRGB(20, 20, 32),
+	BackgroundTransparency = 0.05,
+	Visible = false,
+	ZIndex = 20,
+	Parent = gui,
+}, {
+	corner(16),
+	stroke(3, Color3.fromRGB(70, 70, 110)),
+	make("UISizeConstraint", { MaxSize = Vector2.new(460, 540) }),
+})
+
+local indexTitle = make("TextLabel", {
+	Position = UDim2.new(0, 16, 0, 10),
+	Size = UDim2.new(1, -70, 0, 34),
+	BackgroundTransparency = 1,
+	Font = FONT,
+	TextSize = 26,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextColor3 = Color3.new(1, 1, 1),
+	Text = "INDEX",
+	Parent = indexPanel,
+})
+
+local closeButton = make("TextButton", {
+	AnchorPoint = Vector2.new(1, 0),
+	Position = UDim2.new(1, -10, 0, 10),
+	Size = UDim2.new(0, 36, 0, 36),
+	BackgroundColor3 = Color3.fromRGB(200, 60, 80),
+	Font = FONT,
+	Text = "X",
+	TextSize = 22,
+	TextColor3 = Color3.new(1, 1, 1),
+	Parent = indexPanel,
+}, { corner(10) })
+
+local indexList = make("ScrollingFrame", {
+	Position = UDim2.new(0, 10, 0, 54),
+	Size = UDim2.new(1, -20, 1, -64),
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+	ScrollBarThickness = 6,
+	CanvasSize = UDim2.new(),
+	AutomaticCanvasSize = Enum.AutomaticSize.Y,
+	Parent = indexPanel,
+}, {
+	make("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }),
+})
+
+-- Most common first, rarest last
+local indexOrder = {}
+for id in ipairs(Tiers) do
+	table.insert(indexOrder, id)
+end
+table.sort(indexOrder, function(a, b)
+	local ra, rb = RarityTable.Rarity(a), RarityTable.Rarity(b)
+	if ra ~= rb then
+		return ra < rb
+	end
+	return a < b
+end)
+
+local indexRows = {} -- [tierId] = { name, info, button, canEquip }
+for order, id in ipairs(indexOrder) do
+	local row = make("Frame", {
+		LayoutOrder = order,
+		Size = UDim2.new(1, -8, 0, 54),
+		BackgroundColor3 = Color3.fromRGB(35, 35, 52),
+		Parent = indexList,
+	}, { corner(10) })
+	local entry = {
+		name = make("TextLabel", {
+			Position = UDim2.new(0, 12, 0, 4),
+			Size = UDim2.new(1, -120, 0, 26),
+			BackgroundTransparency = 1,
+			Font = FONT,
+			TextSize = 22,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			Parent = row,
+		}),
+		info = make("TextLabel", {
+			Position = UDim2.new(0, 12, 0, 29),
+			Size = UDim2.new(1, -120, 0, 20),
+			BackgroundTransparency = 1,
+			Font = FONT,
+			TextSize = 15,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			TextColor3 = Color3.fromRGB(190, 190, 205),
+			Parent = row,
+		}),
+		button = make("TextButton", {
+			AnchorPoint = Vector2.new(1, 0.5),
+			Position = UDim2.new(1, -10, 0.5, 0),
+			Size = UDim2.new(0, 96, 0, 36),
+			Font = FONT,
+			TextSize = 18,
+			TextColor3 = Color3.new(1, 1, 1),
+			Parent = row,
+		}, { corner(10) }),
+		canEquip = false,
+	}
+	entry.button.Activated:Connect(function()
+		if entry.canEquip and not rolling then
+			equipTier:FireServer(id)
+		end
+	end)
+	indexRows[id] = entry
+end
+
+local function refreshIndex()
+	local ok, discovered = pcall(HttpService.JSONDecode, HttpService, player:GetAttribute("Discovered") or "{}")
+	if not ok or type(discovered) ~= "table" then
+		discovered = {}
+	end
+	local current = player:GetAttribute("HeightTier")
+	local found = 0
+	for id, entry in pairs(indexRows) do
+		local tier = Tiers[id]
+		local scale = discovered[tier.name]
+		if scale then
+			found += 1
+			entry.name.Text = tier.name:upper()
+			entry.name.TextColor3 = tier.color
+			entry.info.Text = ("%s  •  best %s"):format(RarityTable.FormatOdds(id), RarityTable.FormatScale(scale))
+			entry.button.Visible = true
+			entry.canEquip = id ~= current
+			entry.button.Text = entry.canEquip and "EQUIP" or "EQUIPPED"
+			entry.button.BackgroundColor3 = entry.canEquip and Color3.fromRGB(50, 200, 110) or Color3.fromRGB(80, 80, 100)
+			entry.button.AutoButtonColor = entry.canEquip
+		else
+			entry.name.Text = "???"
+			entry.name.TextColor3 = Color3.fromRGB(110, 110, 130)
+			entry.info.Text = "Not discovered yet"
+			entry.button.Visible = false
+			entry.canEquip = false
+		end
+	end
+	indexTitle.Text = ("INDEX   %d / %d found"):format(found, #Tiers)
+end
+
+indexButton.Activated:Connect(function()
+	indexPanel.Visible = not indexPanel.Visible
+end)
+closeButton.Activated:Connect(function()
+	indexPanel.Visible = false
+end)
+player:GetAttributeChangedSignal("Discovered"):Connect(refreshIndex)
+player:GetAttributeChangedSignal("HeightTier"):Connect(refreshIndex)
+refreshIndex()
 
 -- Keyboard shortcut: R to roll
 UserInputService.InputBegan:Connect(function(input, gameProcessed)

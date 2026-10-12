@@ -11,6 +11,7 @@ local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local DataStoreService = game:GetService("DataStoreService")
 local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService") -- only for JSONEncode, no web requests
 
 local RarityTable = require(ReplicatedStorage:WaitForChild("RarityTable"))
 local Tiers = RarityTable.Tiers
@@ -26,6 +27,8 @@ local BASE_WALKSPEED = 16
 local BASE_JUMP_HEIGHT = 7.2
 local FRIEND_BOOST_PER_FRIEND = 0.10 -- +10% luck per Roblox friend in the same server
 local FRIEND_BOOST_MAX = 0.50 -- capped at +50%
+local GROUP_ID = 5353332 -- placeholder: set this to your group's id
+local GROUP_BOOST = 0.15 -- flat +15% luck for group members, stacks with friend boost
 
 ---------------------------------------------------------------------
 -- REMOTES: the "phone lines" between client and server.
@@ -46,6 +49,7 @@ local rollResult = newRemote("RollResult") -- server -> one client: "here's what
 local announce = newRemote("Announce") -- server -> everyone: "someone rolled something rare"
 local equipBest = newRemote("EquipBest") -- client -> server: "go back to my best height"
 local devForceRoll = newRemote("DevForceRoll") -- Studio-only testing shortcut
+local equipTier = newRemote("EquipTier") -- client -> server: "equip this tier from my Index"
 remotes.Parent = ReplicatedStorage
 
 ---------------------------------------------------------------------
@@ -69,8 +73,17 @@ local function defaultData()
 		bestId = RarityTable.FallbackId,
 		bestScale = 1,
 		rolls = 0,
+		discovered = {}, -- [tierName] = most extreme scale rolled for that tier
 		canSave = false,
 	}
+end
+
+local function markDiscovered(data, tierId, scale)
+	local name = Tiers[tierId].name
+	local old = data.discovered[name]
+	if old == nil or math.abs(math.log(scale)) > math.abs(math.log(old)) then
+		data.discovered[name] = scale
+	end
 end
 
 local function loadData(player)
@@ -104,6 +117,7 @@ local function saveData(player)
 		best = Tiers[data.bestId].name,
 		bestScale = data.bestScale,
 		rolls = data.rolls,
+		discovered = data.discovered,
 	}
 	local ok, err = pcall(function()
 		store:SetAsync("player_" .. player.UserId, saved)
@@ -135,6 +149,62 @@ local function setupLeaderstats(player)
 	leaderstats.Parent = player
 end
 
+---------------------------------------------------------------------
+-- LIVE BOARD: best height of the top 3 players in this server
+-- (Workspace.Lobby.TopRollsBoard, built in Studio)
+---------------------------------------------------------------------
+local function escapeRichText(text)
+	return (text:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"))
+end
+
+local function getBoardRows()
+	local lobby = workspace:FindFirstChild("Lobby")
+	local board = lobby and lobby:FindFirstChild("TopRollsBoard")
+	local display = board and board:FindFirstChild("Display", true)
+	if not display then
+		return nil
+	end
+	local rows = {}
+	for i = 1, 3 do
+		rows[i] = display:FindFirstChild("Row" .. i, true)
+		if not rows[i] then
+			return nil
+		end
+	end
+	return rows
+end
+
+local function updateBoard()
+	local rows = getBoardRows()
+	if not rows then
+		return -- no board in this place; nothing to update
+	end
+	local entries = {}
+	for player, data in pairs(playerData) do
+		if player.Parent then
+			table.insert(entries, { name = player.DisplayName, id = data.bestId, scale = data.bestScale })
+		end
+	end
+	table.sort(entries, function(a, b)
+		return RarityTable.IsBetter(a.id, a.scale, b.id, b.scale)
+	end)
+	for i, row in ipairs(rows) do
+		local entry = entries[i]
+		if entry then
+			local tier = Tiers[entry.id]
+			row.Text = ('%d.  %s   <font color="#%s">%s</font>   %s'):format(
+				i,
+				escapeRichText(entry.name),
+				tier.color:ToHex(),
+				tier.name:upper(),
+				RarityTable.FormatScale(entry.scale)
+			)
+		else
+			row.Text = i .. ".  ---"
+		end
+	end
+end
+
 local function refreshStats(player)
 	local data = playerData[player]
 	local leaderstats = player:FindFirstChild("leaderstats")
@@ -150,6 +220,9 @@ local function refreshStats(player)
 	player:SetAttribute("HeightScale", data.currentScale)
 	player:SetAttribute("BestTier", data.bestId)
 	player:SetAttribute("BestScale", data.bestScale)
+	player:SetAttribute("Discovered", HttpService:JSONEncode(data.discovered)) -- for the Index UI
+
+	updateBoard()
 end
 
 ---------------------------------------------------------------------
@@ -286,8 +359,11 @@ end
 -- ROLLING
 ---------------------------------------------------------------------
 local function getLuck(player)
-	-- "Luck" is the hook for luck potions / VIP gamepass; "FriendBoost" comes from friends in the server.
-	return (player:GetAttribute("Luck") or 1) + (player:GetAttribute("FriendBoost") or 0)
+	-- "Luck" is the hook for luck potions / VIP gamepass; "FriendBoost" comes from friends
+	-- in the server and "GroupBoost" from being in the group.
+	return (player:GetAttribute("Luck") or 1)
+		+ (player:GetAttribute("FriendBoost") or 0)
+		+ (player:GetAttribute("GroupBoost") or 0)
 end
 
 ---------------------------------------------------------------------
@@ -331,6 +407,19 @@ local function refreshAllFriendBoosts(leaving)
 	end
 end
 
+---------------------------------------------------------------------
+-- GROUP PERK: flat +15% luck for members of GROUP_ID
+---------------------------------------------------------------------
+local function refreshGroupBoost(player)
+	local ok, inGroup = pcall(player.IsInGroup, player, GROUP_ID)
+	if not ok then
+		warn(("[RollServer] Group check failed for %s: %s"):format(player.Name, tostring(inGroup)))
+	end
+	if player.Parent then
+		player:SetAttribute("GroupBoost", (ok and inGroup) and GROUP_BOOST or 0)
+	end
+end
+
 local function tryStartCooldown(player)
 	local now = os.clock()
 	if lastRollTime[player] and now - lastRollTime[player] < ROLL_COOLDOWN then
@@ -357,6 +446,7 @@ local function doRoll(player, forcedTierId)
 	local isNewBest = RarityTable.IsBetter(tierId, scale, data.bestId, data.bestScale)
 	data.rolls += 1
 	data.currentId, data.currentScale = tierId, scale
+	markDiscovered(data, tierId, scale)
 	if isNewBest then
 		data.bestId, data.bestScale = tierId, scale
 	end
@@ -391,6 +481,20 @@ equipBest.OnServerEvent:Connect(function(player)
 	refreshStats(player)
 end)
 
+equipTier.OnServerEvent:Connect(function(player, tierId)
+	local data = playerData[player]
+	if not data or typeof(tierId) ~= "number" or not Tiers[tierId] then
+		return
+	end
+	local scale = data.discovered[Tiers[tierId].name]
+	if not scale or not tryStartCooldown(player) then
+		return -- only tiers you've actually rolled
+	end
+	data.currentId, data.currentScale = tierId, scale
+	applyHeight(player)
+	refreshStats(player)
+end)
+
 -- Studio-only: lets the test panel force any tier. Ignored in the live game.
 devForceRoll.OnServerEvent:Connect(function(player, tierId)
 	if not RunService:IsStudio() then
@@ -410,6 +514,8 @@ local function onPlayerAdded(player)
 	player:SetAttribute("FriendBoost", 0)
 	player:SetAttribute("FriendsInServer", 0)
 	refreshAllFriendBoosts() -- everyone re-checks: the newcomer may be someone's friend
+	player:SetAttribute("GroupBoost", 0)
+	task.spawn(refreshGroupBoost, player)
 
 	local data = defaultData()
 	local saved, loadedOk = loadData(player)
@@ -424,7 +530,17 @@ local function onPlayerAdded(player)
 			data.currentId, data.currentScale = current.id, saved.currentScale or current.scale
 		end
 		data.rolls = saved.rolls or 0
+		if type(saved.discovered) == "table" then
+			for name, scale in pairs(saved.discovered) do
+				if RarityTable.ByName[name] and type(scale) == "number" then
+					data.discovered[name] = scale
+				end
+			end
+		end
 	end
+	-- Saves from before the Index existed: count what they're wearing as discovered.
+	markDiscovered(data, data.bestId, data.bestScale)
+	markDiscovered(data, data.currentId, data.currentScale)
 	if not player.Parent then
 		return -- left while we were loading
 	end
@@ -449,6 +565,7 @@ Players.PlayerRemoving:Connect(function(player)
 	saveData(player)
 	playerData[player] = nil
 	lastRollTime[player] = nil
+	updateBoard()
 end)
 
 game:BindToClose(function()
