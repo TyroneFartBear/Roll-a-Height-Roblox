@@ -15,6 +15,7 @@ local UserInputService = game:GetService("UserInputService")
 local TextChatService = game:GetService("TextChatService")
 local SoundService = game:GetService("SoundService")
 local HttpService = game:GetService("HttpService") -- only for JSONDecode, no web requests
+local MarketplaceService = game:GetService("MarketplaceService")
 
 local RarityTable = require(ReplicatedStorage:WaitForChild("RarityTable"))
 local Tiers = RarityTable.Tiers
@@ -26,6 +27,9 @@ local announce = remotes:WaitForChild("Announce")
 local equipBest = remotes:WaitForChild("EquipBest")
 local devForceRoll = remotes:WaitForChild("DevForceRoll")
 local equipTier = remotes:WaitForChild("EquipTier")
+local spinWheel = remotes:WaitForChild("SpinWheel")
+local shopRequest = remotes:WaitForChild("ShopRequest")
+local notify = remotes:WaitForChild("Notify")
 
 local player = Players.LocalPlayer
 
@@ -37,6 +41,9 @@ local POPUP_HOLD_TIME = 2.5 -- how long the result stays on screen
 local BIG_REVEAL_ONE_IN = 1000 -- flash + strong shake at this rarity or rarer
 local SMALL_REVEAL_ONE_IN = 100 -- light shake at this rarity or rarer
 local AUTO_ROLL_INTERVAL = 1.5 -- seconds between auto-rolls
+local FAST_AUTO_ROLL_INTERVAL = 0.45 -- with the Fast Roll pass
+local FOOTSTEP_MIN_SCALE = 10 -- characters this big (or bigger) shake the ground
+local THUD_SOUND = "rbxasset://sounds/action_footsteps_plastic.mp3" -- played slowed down = deep thud
 
 -- Paste sound IDs from the Creator Store here, e.g. "rbxassetid://12345".
 -- Left empty = no sound (nothing breaks).
@@ -182,10 +189,11 @@ local luckLabel = make("TextLabel", {
 	AnchorPoint = Vector2.new(0.5, 1),
 	Position = UDim2.new(0.5, 0, 1, -142),
 	Size = UDim2.new(0, 0, 0, 26),
-	AutomaticSize = Enum.AutomaticSize.X,
+	AutomaticSize = Enum.AutomaticSize.XY, -- grows upward when active boosts add a second line
 	BackgroundColor3 = Color3.fromRGB(20, 20, 30),
 	BackgroundTransparency = 0.35,
 	Font = FONT,
+	RichText = true,
 	TextSize = 18,
 	TextColor3 = Color3.new(1, 1, 1),
 	Text = "Luck: 1.0x",
@@ -357,40 +365,42 @@ applyCamera(false)
 -- scaled-up character Roblox blows that offset up far too much (it grows
 -- with scale squared): at 35x+ the whole body sinks hundreds of studs
 -- through the floor. For big characters we keep each joint's animated
--- rotation but drop its animated position. Each client fixes its own
--- character, which is the one it animates.
+-- rotation but drop its animated position. Every client animates every
+-- character it can see, so this runs for all players (RollServer does the
+-- same for the server's copy).
 ---------------------------------------------------------------------
 local ANIM_FIX_MIN_SCALE = 2
-local myMotors = {}
+local motorCache = setmetatable({}, { __mode = "k" }) -- [character] = its Motor6Ds
 
-local function trackMotors(character)
-	myMotors = {}
-	for _, obj in ipairs(character:GetDescendants()) do
-		if obj:IsA("Motor6D") then
-			table.insert(myMotors, obj)
+local function motorsOf(character)
+	local motors = motorCache[character]
+	if not motors then
+		motors = {}
+		for _, obj in ipairs(character:GetDescendants()) do
+			if obj:IsA("Motor6D") then
+				table.insert(motors, obj)
+			end
 		end
+		character.DescendantAdded:Connect(function(obj)
+			if obj:IsA("Motor6D") then
+				table.insert(motors, obj)
+			end
+		end)
+		motorCache[character] = motors
 	end
-	character.DescendantAdded:Connect(function(obj)
-		if obj:IsA("Motor6D") then
-			table.insert(myMotors, obj)
-		end
-	end)
-end
-
-player.CharacterAdded:Connect(trackMotors)
-if player.Character then
-	trackMotors(player.Character)
+	return motors
 end
 
 RunService.PreSimulation:Connect(function()
-	local character = player.Character
-	if not character or character:GetScale() < ANIM_FIX_MIN_SCALE then
-		return
-	end
-	for _, motor in ipairs(myMotors) do
-		local transform = motor.Transform
-		if transform.Position.Magnitude > 0 then
-			motor.Transform = transform.Rotation
+	for _, other in ipairs(Players:GetPlayers()) do
+		local character = other.Character
+		if character and character:GetScale() >= ANIM_FIX_MIN_SCALE then
+			for _, motor in ipairs(motorsOf(character)) do
+				local transform = motor.Transform
+				if transform.Position.Magnitude > 0 then
+					motor.Transform = transform.Rotation
+				end
+			end
 		end
 	end
 end)
@@ -436,6 +446,60 @@ local function pop(fromScale, time)
 end
 
 ---------------------------------------------------------------------
+-- GIANT FOOTSTEPS: characters 10x+ thud and shake the camera of anyone near
+---------------------------------------------------------------------
+local stepTimers = {} -- [player] = seconds since that giant's last step
+
+RunService.Heartbeat:Connect(function(dt)
+	local myCharacter = player.Character
+	local myRoot = myCharacter and myCharacter:FindFirstChild("HumanoidRootPart")
+	if not myRoot then
+		return
+	end
+	for _, other in ipairs(Players:GetPlayers()) do
+		local character = other.Character
+		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+		local root = character and character:FindFirstChild("HumanoidRootPart")
+		local scale = character and character:GetScale() or 1
+		local walking = humanoid
+			and root
+			and scale >= FOOTSTEP_MIN_SCALE
+			and humanoid.MoveDirection.Magnitude > 0.1
+			and humanoid.FloorMaterial ~= Enum.Material.Air
+		if walking then
+			-- bigger strides = slower steps (0.35s at 1x, ~1.1s at 10x, ~5s at 200x)
+			local interval = 0.35 * math.sqrt(scale)
+			local t = (stepTimers[other] or interval) + dt
+			if t >= interval then
+				t = 0
+				local range = scale * 12
+				local distance = (root.Position - myRoot.Position).Magnitude
+				if distance < range then
+					local closeness = 1 - distance / range
+					local sound = make("Sound", {
+						SoundId = THUD_SOUND,
+						Volume = 0.4 + 0.6 * closeness,
+						PlaybackSpeed = math.clamp(0.6 - scale / 500, 0.25, 0.6),
+						RollOffMinDistance = scale * 2,
+						RollOffMaxDistance = range,
+						Parent = root,
+					})
+					sound:Play()
+					task.delay(3, sound.Destroy, sound)
+					shake(0.25, 0.35 * closeness)
+				end
+			end
+			stepTimers[other] = t
+		else
+			stepTimers[other] = nil
+		end
+	end
+end)
+Players.PlayerRemoving:Connect(function(other)
+	stepTimers[other] = nil
+end)
+
+---------------------------------------------------------------------
 -- ROLL FLOW: click -> server rolls -> spin -> reveal
 ---------------------------------------------------------------------
 local rolling = false
@@ -475,7 +539,7 @@ local function spin(duration)
 	end
 end
 
-local function reveal(tierId, scale, isNewBest)
+local function reveal(tierId, scale, isNewBest, essence)
 	local tier = Tiers[tierId]
 	local rarity = RarityTable.Rarity(tierId)
 
@@ -488,6 +552,9 @@ local function reveal(tierId, scale, isNewBest)
 		RarityTable.FormatScale(scale),
 		RarityTable.FormatHeight(scale)
 	)
+	if essence and essence > 0 then
+		detailLabel.Text ..= ("   •   +%d Essence"):format(essence)
+	end
 	local showNewBest = isNewBest and rarity > 1
 	newBestLabel.TextTransparency = showNewBest and 0 or 1
 	newBestLabel:FindFirstChildOfClass("UIStroke").Transparency = showNewBest and 0 or 1
@@ -534,12 +601,17 @@ local function tryRoll(forcedTierId)
 	end)
 end
 
-rollResult.OnClientEvent:Connect(function(tierId, scale, isNewBest, spinTime)
+rollResult.OnClientEvent:Connect(function(tierId, scale, isNewBest, spinTime, essence)
 	requestToken += 1 -- cancels the safety net; we got an answer
 	setRolling(true)
 	spin(spinTime)
-	reveal(tierId, scale, isNewBest)
-	task.wait(autoOn and 0.15 or 0.5) -- shorter pause keeps auto-roll on its 1.5s beat
+	reveal(tierId, scale, isNewBest, essence)
+	-- shorter pause keeps auto-roll on its beat
+	local pause = 0.5
+	if autoOn then
+		pause = player:GetAttribute("Pass_FastRoll") and 0.05 or 0.15
+	end
+	task.wait(pause)
 	setRolling(false)
 end)
 
@@ -576,7 +648,8 @@ local function setAuto(on)
 	local myToken = autoToken
 	task.spawn(function()
 		while autoOn and autoToken == myToken do
-			if not rolling and os.clock() - lastRollFire >= AUTO_ROLL_INTERVAL then
+			local interval = player:GetAttribute("Pass_FastRoll") and FAST_AUTO_ROLL_INTERVAL or AUTO_ROLL_INTERVAL
+			if not rolling and os.clock() - lastRollFire >= interval then
 				tryRoll()
 			end
 			task.wait(0.05)
@@ -596,25 +669,21 @@ local function formatLuck(luck)
 	return (("%.2f"):format(luck):gsub("0$", "")) .. "x"
 end
 
+-- The server works out total luck and what's active, and sends it as "LuckInfo".
 local function refreshLuck()
-	local friend = player:GetAttribute("FriendBoost") or 0
-	local group = player:GetAttribute("GroupBoost") or 0
-	local luck = (player:GetAttribute("Luck") or 1) + friend + group
-	local friendPct = math.floor(friend * 100 + 0.5)
-	local groupPct = math.floor(group * 100 + 0.5)
-	local parts = { "Luck: " .. formatLuck(luck) }
-	if friendPct > 0 then
-		table.insert(parts, ("Friend Boost +%d%%"):format(friendPct))
+	local ok, info = pcall(HttpService.JSONDecode, HttpService, player:GetAttribute("LuckInfo") or "")
+	if not ok or type(info) ~= "table" then
+		info = { total = 1, parts = {} }
 	end
-	if groupPct > 0 then
-		table.insert(parts, ("Group Member +%d%%"):format(groupPct))
+	local text = "Luck: " .. formatLuck(info.total or 1)
+	local active = type(info.parts) == "table" and #info.parts > 0
+	if active then
+		text ..= '\n<font size="14">' .. table.concat(info.parts, "  •  ") .. "</font>"
 	end
-	luckLabel.Text = table.concat(parts, "  •  ")
-	luckLabel.TextColor3 = (friendPct + groupPct > 0) and Color3.fromRGB(120, 255, 150) or Color3.new(1, 1, 1)
+	luckLabel.Text = text
+	luckLabel.TextColor3 = active and Color3.fromRGB(120, 255, 150) or Color3.new(1, 1, 1)
 end
-player:GetAttributeChangedSignal("FriendBoost"):Connect(refreshLuck)
-player:GetAttributeChangedSignal("GroupBoost"):Connect(refreshLuck)
-player:GetAttributeChangedSignal("Luck"):Connect(refreshLuck)
+player:GetAttributeChangedSignal("LuckInfo"):Connect(refreshLuck)
 refreshLuck()
 
 ---------------------------------------------------------------------
@@ -622,7 +691,7 @@ refreshLuck()
 ---------------------------------------------------------------------
 local indexButton = make("TextButton", {
 	AnchorPoint = Vector2.new(0, 0.5),
-	Position = UDim2.new(0, 12, 0.5, 0),
+	Position = UDim2.new(0, 12, 0.5, -54),
 	Size = UDim2.new(0, 96, 0, 44),
 	BackgroundColor3 = Color3.fromRGB(40, 150, 230),
 	Font = FONT,
@@ -785,6 +854,246 @@ player:GetAttributeChangedSignal("Discovered"):Connect(refreshIndex)
 player:GetAttributeChangedSignal("HeightTier"):Connect(refreshIndex)
 refreshIndex()
 
+---------------------------------------------------------------------
+-- TOAST: short messages from the server (wheel prizes, orbs, blessings)
+---------------------------------------------------------------------
+local toast = make("TextLabel", {
+	AnchorPoint = Vector2.new(0.5, 0),
+	Position = UDim2.new(0.5, 0, 0, 122),
+	Size = UDim2.new(0, 0, 0, 34),
+	AutomaticSize = Enum.AutomaticSize.X,
+	BackgroundColor3 = Color3.fromRGB(15, 15, 25),
+	BackgroundTransparency = 0.2,
+	Font = FONT,
+	TextSize = 22,
+	TextColor3 = Color3.new(1, 1, 1),
+	Text = "",
+	Visible = false,
+	ZIndex = 30,
+	Parent = gui,
+}, {
+	corner(12),
+	make("UIPadding", { PaddingLeft = UDim.new(0, 14), PaddingRight = UDim.new(0, 14) }),
+})
+local toastToken = 0
+
+local function showToast(text, color)
+	toastToken += 1
+	local myToken = toastToken
+	toast.Text = text
+	toast.TextColor3 = color or Color3.new(1, 1, 1)
+	toast.Visible = true
+	task.delay(3.5, function()
+		if toastToken == myToken then
+			toast.Visible = false
+		end
+	end)
+end
+notify.OnClientEvent:Connect(showToast)
+
+---------------------------------------------------------------------
+-- GAMBLER'S WHEEL button (the physical wheel near spawn has a prompt too)
+---------------------------------------------------------------------
+local wheelButton = make("TextButton", {
+	AnchorPoint = Vector2.new(0, 0.5),
+	Position = UDim2.new(0, 12, 0.5, 54),
+	Size = UDim2.new(0, 96, 0, 52),
+	BackgroundColor3 = Color3.fromRGB(150, 70, 230),
+	Font = FONT,
+	Text = "WHEEL",
+	TextColor3 = Color3.new(1, 1, 1),
+	TextSize = 16,
+	Parent = gui,
+}, { corner(12), stroke(3, Color3.fromRGB(50, 20, 90)) })
+
+local function refreshWheelButton()
+	local cost = remotes:GetAttribute("EssencePerSpin") or 50
+	wheelButton.Text = ("SPIN WHEEL\n%d/%d"):format(player:GetAttribute("Essence") or 0, cost)
+end
+wheelButton.Activated:Connect(function()
+	spinWheel:FireServer()
+end)
+player:GetAttributeChangedSignal("Essence"):Connect(refreshWheelButton)
+refreshWheelButton()
+
+---------------------------------------------------------------------
+-- SHOP: gamepasses (in Studio the button just toggles a pass for testing)
+---------------------------------------------------------------------
+local PASSES = {
+	{ key = "Luck2x", name = "2x Luck", desc = "Permanently doubles your luck.", color = Color3.fromRGB(80, 220, 120) },
+	{ key = "FastRoll", name = "Fast Roll", desc = "Rolls spin in 0.4s. Auto-roll goes 3x faster.", color = Color3.fromRGB(80, 170, 255) },
+	{ key = "VIP", name = "VIP", desc = "+25% luck and a golden VIP tag over your head and in chat.", color = Color3.fromRGB(255, 215, 0) },
+}
+local IS_STUDIO = RunService:IsStudio()
+
+local shopButton = make("TextButton", {
+	AnchorPoint = Vector2.new(0, 0.5),
+	Position = UDim2.new(0, 12, 0.5, 0),
+	Size = UDim2.new(0, 96, 0, 44),
+	BackgroundColor3 = Color3.fromRGB(255, 180, 40),
+	Font = FONT,
+	Text = "SHOP",
+	TextColor3 = Color3.new(1, 1, 1),
+	TextSize = 22,
+	Parent = gui,
+}, { corner(12), stroke(3, Color3.fromRGB(110, 60, 0)) })
+
+local shopPanel = make("Frame", {
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Position = UDim2.fromScale(0.5, 0.45),
+	Size = UDim2.fromScale(0.9, 0.7),
+	BackgroundColor3 = Color3.fromRGB(20, 20, 32),
+	BackgroundTransparency = 0.05,
+	Visible = false,
+	ZIndex = 20,
+	Parent = gui,
+}, {
+	corner(16),
+	stroke(3, Color3.fromRGB(110, 90, 40)),
+	make("UISizeConstraint", { MaxSize = Vector2.new(460, 420) }),
+})
+
+make("TextLabel", {
+	Position = UDim2.new(0, 16, 0, 10),
+	Size = UDim2.new(1, -70, 0, 34),
+	BackgroundTransparency = 1,
+	Font = FONT,
+	TextSize = 26,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextColor3 = Color3.fromRGB(255, 215, 0),
+	Text = IS_STUDIO and "SHOP  (Studio: buttons toggle)" or "SHOP",
+	Parent = shopPanel,
+})
+
+local shopClose = make("TextButton", {
+	AnchorPoint = Vector2.new(1, 0),
+	Position = UDim2.new(1, -10, 0, 10),
+	Size = UDim2.new(0, 36, 0, 36),
+	BackgroundColor3 = Color3.fromRGB(200, 60, 80),
+	Font = FONT,
+	Text = "X",
+	TextSize = 22,
+	TextColor3 = Color3.new(1, 1, 1),
+	Parent = shopPanel,
+}, { corner(10) })
+
+local shopList = make("ScrollingFrame", {
+	Position = UDim2.new(0, 10, 0, 54),
+	Size = UDim2.new(1, -20, 1, -64),
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+	ScrollBarThickness = 6,
+	CanvasSize = UDim2.new(),
+	AutomaticCanvasSize = Enum.AutomaticSize.Y,
+	Parent = shopPanel,
+}, {
+	make("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder }),
+})
+
+local shopCards = {} -- [passKey] = { button, price, priceText }
+for order, pass in ipairs(PASSES) do
+	local card = make("Frame", {
+		LayoutOrder = order,
+		Size = UDim2.new(1, -8, 0, 96),
+		BackgroundColor3 = Color3.fromRGB(35, 35, 52),
+		Parent = shopList,
+	}, { corner(12), stroke(2, pass.color) })
+	make("TextLabel", {
+		Position = UDim2.new(0, 12, 0, 6),
+		Size = UDim2.new(1, -130, 0, 28),
+		BackgroundTransparency = 1,
+		Font = FONT,
+		TextSize = 24,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextColor3 = pass.color,
+		Text = pass.name,
+		Parent = card,
+	})
+	make("TextLabel", {
+		Position = UDim2.new(0, 12, 0, 34),
+		Size = UDim2.new(1, -130, 0, 38),
+		BackgroundTransparency = 1,
+		Font = FONT,
+		TextSize = 15,
+		TextWrapped = true,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Top,
+		TextColor3 = Color3.fromRGB(200, 200, 215),
+		Text = pass.desc,
+		Parent = card,
+	})
+	local price = make("TextLabel", {
+		Position = UDim2.new(0, 12, 1, -24),
+		Size = UDim2.new(1, -130, 0, 20),
+		BackgroundTransparency = 1,
+		Font = FONT,
+		TextSize = 15,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextColor3 = Color3.fromRGB(150, 230, 150),
+		Text = "",
+		Parent = card,
+	})
+	local button = make("TextButton", {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -10, 0.5, 0),
+		Size = UDim2.new(0, 104, 0, 40),
+		Font = FONT,
+		TextSize = 18,
+		TextColor3 = Color3.new(1, 1, 1),
+		Parent = card,
+	}, { corner(10) })
+	button.Activated:Connect(function()
+		shopRequest:FireServer(pass.key)
+	end)
+	shopCards[pass.key] = { button = button, price = price, priceText = "" }
+end
+
+local function refreshShop()
+	for _, pass in ipairs(PASSES) do
+		local card = shopCards[pass.key]
+		local owned = player:GetAttribute("Pass_" .. pass.key) == true
+		if IS_STUDIO then
+			card.button.Text = owned and "TEST: ON" or "TEST: OFF"
+		else
+			card.button.Text = owned and "OWNED" or "BUY"
+		end
+		card.button.BackgroundColor3 = owned and Color3.fromRGB(80, 80, 100) or Color3.fromRGB(50, 200, 110)
+		card.price.Text = owned and "Active" or card.priceText
+	end
+end
+
+-- Prices come from Roblox once real gamepass ids are set in RollServer.
+task.spawn(function()
+	for _, pass in ipairs(PASSES) do
+		local id = remotes:GetAttribute("PassId_" .. pass.key) or 0
+		local text = "Coming soon"
+		if id ~= 0 then
+			local ok, info = pcall(MarketplaceService.GetProductInfo, MarketplaceService, id, Enum.InfoType.GamePass)
+			if ok and info and info.PriceInRobux then
+				text = "R$ " .. info.PriceInRobux
+			end
+		end
+		shopCards[pass.key].priceText = text
+	end
+	refreshShop()
+end)
+
+for _, pass in ipairs(PASSES) do
+	player:GetAttributeChangedSignal("Pass_" .. pass.key):Connect(refreshShop)
+end
+refreshShop()
+
+shopButton.Activated:Connect(function()
+	shopPanel.Visible = not shopPanel.Visible
+	indexPanel.Visible = false
+end)
+shopClose.Activated:Connect(function()
+	shopPanel.Visible = false
+end)
+indexButton.Activated:Connect(function()
+	shopPanel.Visible = false -- only one panel open at a time
+end)
+
 -- Keyboard shortcut: R to roll
 UserInputService.InputBegan:Connect(function(input, gameProcessed)
 	if not gameProcessed and input.KeyCode == Enum.KeyCode.R then
@@ -833,6 +1142,19 @@ announce.OnClientEvent:Connect(function(displayName, tierId, scale)
 		end
 	end)
 end)
+
+---------------------------------------------------------------------
+-- VIP CHAT TAG: golden [VIP] in front of VIP players' chat messages
+---------------------------------------------------------------------
+TextChatService.OnIncomingMessage = function(message)
+	local properties = Instance.new("TextChatMessageProperties")
+	local source = message.TextSource
+	local sender = source and Players:GetPlayerByUserId(source.UserId)
+	if sender and sender:GetAttribute("VIP") then
+		properties.PrefixText = '<font color="#FFD700">[VIP]</font> ' .. message.PrefixText
+	end
+	return properties
+end
 
 ---------------------------------------------------------------------
 -- STUDIO-ONLY TEST PANEL (never shows in the real game)

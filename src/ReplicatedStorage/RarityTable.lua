@@ -15,7 +15,7 @@
 	  oneIn    - odds, "1 in N". Leave it out (nil) for exactly ONE tier:
 	             that tier gets whatever chance is left over.
 	  color    - main color for text and the aura
-	  aura     - character effect: "None", "Sparkles", "Glow", "Flames", "Cosmic"
+	  aura     - character effect: "None", "Sparkles", "Glow", "Flames", "Starry", "Cosmic", "Nebula"
 	  announce - true = the whole server gets a banner when someone rolls it
 ]]
 
@@ -53,10 +53,10 @@ RarityTable.Tiers = {
 	{ name = "Lighthouse",     title = "Beacon of the Coast",  scale = 7,    oneIn = 1500,    color = rgb(255, 240, 150), aura = "Glow",     announce = true },
 	{ name = "Skyscraper",     title = "Cloud Scraper",        scale = 12,   oneIn = 6000,    color = rgb(120, 220, 255), aura = "Glow",     announce = true },
 	{ name = "Mountain",       title = "Peak Performer",       scale = 20,   oneIn = 25000,   color = rgb(255, 150, 60),  aura = "Flames",   announce = true },
-	{ name = "Colossus",       title = "Earth Shaker",         scale = 35,   oneIn = 80000,   color = rgb(255, 80, 40),   aura = "Flames",   announce = true },
+	{ name = "Colossus",       title = "Earth Shaker",         scale = 35,   oneIn = 80000,   color = rgb(255, 80, 40),   aura = "Starry",   announce = true },
 	{ name = "Storm Titan",    title = "Lord of Thunder",      scale = 60,   oneIn = 200000,  color = rgb(120, 160, 255), aura = "Cosmic",   announce = true },
 	{ name = "Planet Breaker", title = "Moon Kicker",          scale = 100,  oneIn = 400000,  color = rgb(255, 60, 200),  aura = "Cosmic",   announce = true },
-	{ name = "World Eater",    title = "Devourer of Worlds",   scale = 200,  oneIn = 1000000, color = rgb(255, 20, 60),   aura = "Cosmic",   announce = true },
+	{ name = "World Eater",    title = "Devourer of Worlds",   scale = 200,  oneIn = 1000000, color = rgb(255, 20, 60),   aura = "Nebula",   announce = true },
 }
 
 local Tiers = RarityTable.Tiers
@@ -112,6 +112,31 @@ function RarityTable.Roll(luck, rng)
 		end
 	end
 	return fallbackId, RarityTable.ScaleFor(fallbackId, rng)
+end
+
+-- A roll that can only land on tiers at least 1 in minOneIn rare, keeping
+-- their odds relative to each other. Used by the wheel's Titan Pity Roll.
+function RarityTable.RollAtLeast(minOneIn, rng)
+	local total = 0
+	local leastRare = nil
+	for _, id in ipairs(rollOrder) do
+		if Tiers[id].oneIn >= minOneIn then
+			total += 1 / Tiers[id].oneIn
+			leastRare = id -- rollOrder is rarest first, so this ends on the least rare
+		end
+	end
+	assert(leastRare, "RarityTable.RollAtLeast: no tier is that rare")
+	local r = rng:NextNumber() * total
+	for _, id in ipairs(rollOrder) do
+		local tier = Tiers[id]
+		if tier.oneIn >= minOneIn then
+			r -= 1 / tier.oneIn
+			if r < 0 then
+				return id, RarityTable.ScaleFor(id, rng)
+			end
+		end
+	end
+	return leastRare, RarityTable.ScaleFor(leastRare, rng) -- floating point leftovers
 end
 
 -- How rare a tier is, as N in "1 in N". The fallback counts as 1.
