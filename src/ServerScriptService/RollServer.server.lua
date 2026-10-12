@@ -73,8 +73,18 @@ local PIT_PARTICIPATION_ESSENCE = 1 -- everyone in the pit, every 10s while gian
 local LAUNCH_MAX_SCALE = 2.5
 local LAUNCH_COOLDOWN = 3
 
--- Titan's Throne (tag "ApexPedestal"): 100x+ players standing on it
-local THRONE_MIN_SCALE = 100
+-- Updraft Void Catcher: a non-giant who falls off a cloud gets caught by a
+-- soft updraft below this height and set down at the spawn plaza
+local CATCH_Y = 150
+local CATCH_MAX_SCALE = 10 -- giants step down from the clouds on purpose
+local CATCH_DROP = 15 -- only after falling this far below the cloud they left
+
+-- Mist barriers (collision group "MistBarrier") ring the cloud edges. They
+-- stop normal-sized players; characters this big walk through them.
+local MIST_PASS_SCALE = 10
+
+-- Titan's Throne (tag "ApexPedestal"): 50x+ players standing on it
+local THRONE_MIN_SCALE = 50
 local THRONE_LUCK = 0.5 -- +50% for the titan on the throne
 local FAVOR_LUCK = 0.10 -- +10% "Titan's Favor" for everyone else while the throne is taken
 
@@ -100,8 +110,8 @@ local GAMEPASSES = {
 }
 local DEBUG_UNLOCK_PASSES = true -- Studio playtests only: every pass starts unlocked. Never applies in the live game.
 local VIP_BOOST = 0.25
-local FAST_ROLL_COOLDOWN = 0.35
-local FAST_SPIN_TIME = 0.4
+local FAST_ROLL_COOLDOWN = 0.7 -- Fast Roll: a roll every ~0.75s (normal: 1.3s)
+local FAST_SPIN_TIME = 0.55 -- still a full (short) spin, nothing skipped
 
 ---------------------------------------------------------------------
 -- REMOTES: the "phone lines" between client and server.
@@ -150,7 +160,7 @@ local rng = Random.new()
 local playerData = {} -- [player] = { currentId, currentScale, bestId, bestScale, rolls, canSave }
 local lastRollTime = {} -- [player] = os.clock() of their last roll
 local effects = {} -- [player] = temporary boosts and owned passes (not saved), see newEffects()
-local throneTaken = false -- someone 100x+ is on the Titan's Throne (see TITAN'S THRONE)
+local throneTaken = false -- someone 50x+ is on the Titan's Throne (see TITAN'S THRONE)
 
 local function defaultData()
 	return {
@@ -182,6 +192,8 @@ local function newEffects()
 		lastStomp = 0,
 		lastLaunch = 0,
 		wheelBusy = false,
+		cloudFeetY = nil, -- feet height on the last cloud stood on (Void Catcher), nil = on the ground
+		catching = false,
 	}
 end
 
@@ -341,6 +353,10 @@ end
 local AURA_NAME = "HeightAura"
 local SPARKLE_TEXTURE = "rbxasset://textures/particles/sparkles_main.dds"
 local FIRE_TEXTURE = "rbxasset://textures/particles/fire_main.dds"
+local ELECTRIC_CYAN = Color3.fromRGB(70, 225, 255)
+local RADIANT_GOLD = Color3.fromRGB(255, 205, 60)
+local COSMIC_VIOLET = Color3.fromRGB(130, 50, 255)
+local OBSIDIAN = Color3.fromRGB(25, 10, 40)
 
 local function clearAura(character)
 	for _, obj in ipairs(character:GetDescendants()) do
@@ -388,25 +404,6 @@ local function addGlow(character, root, color, scale)
 	light.Parent = root
 end
 
-local SMOKE_TEXTURE = "rbxasset://textures/particles/smoke_main.dds"
-
-local function addNebula(root, scale, fromColor, toColor)
-	local emitter = Instance.new("ParticleEmitter")
-	emitter.Name = AURA_NAME
-	emitter.Texture = SMOKE_TEXTURE
-	emitter.Color = ColorSequence.new(fromColor, toColor)
-	emitter.LightEmission = 0.4
-	emitter.Transparency = NumberSequence.new(0.35, 1)
-	emitter.Rate = 12
-	emitter.Lifetime = NumberRange.new(3, 5)
-	emitter.Size = NumberSequence.new(1.5 * scale, 4 * scale)
-	emitter.Speed = NumberRange.new(0.3 * scale, 1 * scale)
-	emitter.Rotation = NumberRange.new(0, 360)
-	emitter.RotSpeed = NumberRange.new(-20, 20)
-	emitter.SpreadAngle = Vector2.new(180, 180)
-	emitter.Parent = root
-end
-
 local function addMotes(root, color, scale)
 	local emitter = Instance.new("ParticleEmitter")
 	emitter.Name = AURA_NAME
@@ -431,84 +428,115 @@ local function addLight(root, color, scale)
 	light.Parent = root
 end
 
--- Dust puffing up around the feet (an attachment at ground level under the root).
-local function addGroundDust(character, root, scale)
-	local humanoid = character:FindFirstChildOfClass("Humanoid")
-	local feet = Instance.new("Attachment")
-	feet.Name = AURA_NAME
-	feet.Position = Vector3.new(0, -(root.Size.Y / 2 + (humanoid and humanoid.HipHeight or 0)), 0)
-	feet.Parent = root
-	local dust = Instance.new("ParticleEmitter")
-	dust.Name = AURA_NAME
-	dust.Texture = SMOKE_TEXTURE
-	dust.Color = ColorSequence.new(Color3.fromRGB(170, 150, 120))
-	dust.LightEmission = 0
-	dust.Transparency = NumberSequence.new(0.6, 1)
-	dust.Size = NumberSequence.new(0.5 * scale, 1.5 * scale)
-	dust.Lifetime = NumberRange.new(1.5, 2.5)
-	dust.Rate = 6
-	dust.Speed = NumberRange.new(0.2 * scale, 0.6 * scale)
-	dust.SpreadAngle = Vector2.new(90, 90)
-	dust.Acceleration = Vector3.new(0, 0.1 * scale, 0)
-	dust.Parent = feet
-end
-
-local function addOutline(character, fillColor, outlineColor)
+-- Highlight around 10x+ characters. Each client slowly pulses the outline
+-- between the OutlineA and OutlineB colors.
+local function addOutline(character, fillColor, outlineA, outlineB)
 	local highlight = Instance.new("Highlight")
 	highlight.Name = AURA_NAME
 	highlight.FillColor = fillColor
 	highlight.FillTransparency = 0.85
-	highlight.OutlineColor = outlineColor
-	highlight.OutlineTransparency = 0
+	highlight.OutlineColor = outlineA
+	highlight.OutlineTransparency = 0.05
 	highlight.Adornee = character
+	highlight:SetAttribute("OutlineA", outlineA)
+	highlight:SetAttribute("OutlineB", outlineB)
 	highlight.Parent = character
 end
 
--- Electric arcs: beams between random points around the body. "Crackle" tells
--- each client to keep re-bending them so they flicker like lightning.
-local function addArcs(root, scale, color, count)
-	for _ = 1, count do
-		local a = rng:NextNumber(0, math.pi * 2)
-		local b = a + rng:NextNumber(0.6, 1.6)
-		local from = Instance.new("Attachment")
-		from.Name = AURA_NAME
-		from.Position = Vector3.new(math.cos(a) * 1.1 * scale, rng:NextNumber(-1.4, 1.4) * scale, math.sin(a) * 1.1 * scale)
-		from.Parent = root
-		local to = Instance.new("Attachment")
-		to.Name = AURA_NAME
-		to.Position = Vector3.new(math.cos(b) * 1.1 * scale, rng:NextNumber(-1.4, 1.4) * scale, math.sin(b) * 1.1 * scale)
-		to.Parent = root
+-- Vertical flame / energy streaks shooting up out of the body: fast, narrow,
+-- stretched along their direction of travel and tapering to nothing.
+local function addStreaks(root, scale, color, tipColor, rate, glow)
+	local streaks = Instance.new("ParticleEmitter")
+	streaks.Name = AURA_NAME
+	streaks.Texture = FIRE_TEXTURE
+	streaks.Color = ColorSequence.new(color, tipColor)
+	streaks.LightEmission = glow or 1
+	streaks.LightInfluence = 0
+	streaks.Orientation = Enum.ParticleOrientation.VelocityParallel
+	streaks.Squash = NumberSequence.new(2.5) -- tall and thin
+	streaks.Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 0.15),
+		NumberSequenceKeypoint.new(0.7, 0.4),
+		NumberSequenceKeypoint.new(1, 1),
+	})
+	streaks.Size = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 0.7 * scale),
+		NumberSequenceKeypoint.new(1, 0),
+	})
+	streaks.Lifetime = NumberRange.new(0.35, 0.6)
+	streaks.Rate = rate
+	streaks.Speed = NumberRange.new(9 * scale, 14 * scale)
+	streaks.EmissionDirection = Enum.NormalId.Top
+	streaks.SpreadAngle = Vector2.new(6, 6)
+	streaks.Shape = Enum.ParticleEmitterShape.Box
+	streaks.ShapeStyle = Enum.ParticleEmitterShapeStyle.Volume
+	streaks.Parent = root
+end
+
+-- Lightning arcs between the limbs. Every limb gets an attachment marked
+-- "ArcPoint"; the beams start on hand-to-hand and torso-to-head, and each
+-- client re-wires them to random limb pairs every 0.1s ("Crackle") and
+-- re-bends them, so they jump around the body like electricity.
+local ARC_LIMBS = {
+	"LeftHand", "RightHand", "Head", "UpperTorso", "LowerTorso", "LeftFoot", "RightFoot", -- R15
+	"Left Arm", "Right Arm", "Torso", "Left Leg", "Right Leg", -- R6
+}
+
+local function addArcs(character, root, scale, color, count)
+	local points, all = {}, {}
+	for _, limbName in ipairs(ARC_LIMBS) do
+		local limb = character:FindFirstChild(limbName)
+		if limb and limb:IsA("BasePart") then
+			local point = Instance.new("Attachment")
+			point.Name = AURA_NAME
+			point:SetAttribute("ArcPoint", true)
+			point.Parent = limb
+			points[limbName] = point
+			table.insert(all, point)
+		end
+	end
+	if #all < 2 then
+		return
+	end
+	local starts = {
+		{ points.LeftHand or points["Left Arm"], points.RightHand or points["Right Arm"] },
+		{ points.UpperTorso or points.Torso, points.Head },
+	}
+	for i = 1, count do
+		local from, to = starts[i] and starts[i][1], starts[i] and starts[i][2]
+		if not (from and to) then
+			from = all[rng:NextInteger(1, #all)]
+			repeat
+				to = all[rng:NextInteger(1, #all)]
+			until to ~= from
+		end
 		local beam = Instance.new("Beam")
 		beam.Name = AURA_NAME
 		beam.Attachment0 = from
 		beam.Attachment1 = to
-		beam.Color = ColorSequence.new(color)
+		beam.Color = ColorSequence.new({
+			ColorSequenceKeypoint.new(0, color),
+			ColorSequenceKeypoint.new(0.5, Color3.new(1, 1, 1)), -- white-hot middle
+			ColorSequenceKeypoint.new(1, color),
+		})
 		beam.LightEmission = 1
 		beam.LightInfluence = 0
-		beam.Width0 = 0.08 * scale
-		beam.Width1 = 0.08 * scale
-		beam.Segments = 12
+		beam.Width0 = 0.14 * scale
+		beam.Width1 = 0.1 * scale
+		beam.Texture = SPARKLE_TEXTURE -- crackling sparks running along the arc
+		beam.TextureMode = Enum.TextureMode.Wrap
+		beam.TextureLength = 0.8 * scale
+		beam.TextureSpeed = 4
+		beam.Segments = 16
 		beam.FaceCamera = true
-		beam.Transparency = NumberSequence.new(0.1)
+		beam.Transparency = NumberSequence.new(0.05)
 		beam:SetAttribute("Crackle", scale)
 		beam.Parent = root
 	end
 end
 
--- Tall columns of dark cosmic energy rising off the body.
-local function addPillars(root, scale)
-	local pillar = Instance.new("ParticleEmitter")
-	pillar.Name = AURA_NAME
-	pillar.Texture = SMOKE_TEXTURE
-	pillar.Color = ColorSequence.new(Color3.fromRGB(110, 40, 190), Color3.fromRGB(5, 0, 15))
-	pillar.LightEmission = 0.25
-	pillar.Transparency = NumberSequence.new(0.3, 1)
-	pillar.Size = NumberSequence.new(1.2 * scale, 2 * scale)
-	pillar.Lifetime = NumberRange.new(1.5, 2.5)
-	pillar.Rate = 20
-	pillar.Speed = NumberRange.new(3 * scale, 5 * scale)
-	pillar.SpreadAngle = Vector2.new(6, 6)
-	pillar.Parent = root
+-- Cosmic sparks shooting up off a god-tier body.
+local function addCosmicSparks(root, scale)
 	local sparks = Instance.new("ParticleEmitter")
 	sparks.Name = AURA_NAME
 	sparks.Texture = SPARKLE_TEXTURE
@@ -541,25 +569,26 @@ local function applyAura(character, tier, scale)
 		-- small / common tiers: a few drifting earth-tone motes
 		addMotes(root, tier.color, scale)
 	elseif tier.aura == "Ki" then
-		-- anime ki: cyan/gold outline and rising flames
-		addOutline(character, Color3.fromRGB(80, 220, 255), Color3.fromRGB(255, 200, 60))
+		-- anime ki: cyan/gold outline and vertical flame streaks
+		addOutline(character, tier.color, ELECTRIC_CYAN, RADIANT_GOLD)
 		addLight(root, tier.color, scale)
-		addEmitter(root, FIRE_TEXTURE, tier.color, scale, 35, true)
-		addEmitter(root, FIRE_TEXTURE, Color3.fromRGB(255, 210, 90), scale * 0.7, 20, true)
-		addGroundDust(character, root, scale)
+		addStreaks(root, scale, tier.color, Color3.new(1, 1, 1), 40)
+		addStreaks(root, scale * 0.7, Color3.fromRGB(255, 210, 90), Color3.fromRGB(255, 120, 40), 25)
 	elseif tier.aura == "Lightning" then
-		-- crackling arcs (each client makes them flicker); the spinning ground glyph is drawn by each client
-		addOutline(character, tier.color, Color3.fromRGB(200, 240, 255))
+		-- energy streaks + limb-to-limb lightning (each client makes it crackle);
+		-- the spinning ground glyph (50x+) is drawn by each client
+		addOutline(character, tier.color, ELECTRIC_CYAN, RADIANT_GOLD)
 		addLight(root, tier.color, scale)
-		addArcs(root, scale, Color3.fromRGB(170, 225, 255), 5)
+		addStreaks(root, scale, Color3.fromRGB(150, 235, 255), Color3.new(1, 1, 1), 45)
+		addArcs(character, root, scale, Color3.fromRGB(120, 210, 255), 5)
 		addEmitter(root, SPARKLE_TEXTURE, tier.color, scale, 20, false)
-		addGroundDust(character, root, scale)
 	elseif tier.aura == "Super" then
-		-- full super aura; the orbiting void and footstep shockwaves are drawn by each client
-		addOutline(character, Color3.fromRGB(40, 10, 70), Color3.fromRGB(170, 90, 255))
-		addPillars(root, scale)
-		addNebula(root, scale, Color3.fromRGB(90, 20, 140), Color3.fromRGB(10, 10, 40))
-		addArcs(root, scale, Color3.fromRGB(150, 70, 255), 6)
+		-- full super aura; the orbiting void, ground glyph and footstep shockwaves are drawn by each client
+		addOutline(character, Color3.fromRGB(20, 8, 35), COSMIC_VIOLET, OBSIDIAN)
+		addStreaks(root, scale, Color3.fromRGB(160, 80, 255), Color3.fromRGB(60, 0, 90), 55)
+		addStreaks(root, scale * 1.3, Color3.fromRGB(40, 10, 70), Color3.fromRGB(0, 0, 0), 20, 0) -- dark void streaks
+		addCosmicSparks(root, scale)
+		addArcs(character, root, scale, Color3.fromRGB(150, 70, 255), 6)
 		local pulse = Instance.new("PointLight")
 		pulse.Name = AURA_NAME
 		pulse.Color = Color3.fromRGB(150, 70, 255)
@@ -573,6 +602,30 @@ end
 ---------------------------------------------------------------------
 -- RESIZING THE CHARACTER
 ---------------------------------------------------------------------
+-- Mist barriers (collision group "MistBarrier") stop normal-sized players at
+-- the cloud edges; characters MIST_PASS_SCALE+ are in "Giants" and walk through.
+local PhysicsService = game:GetService("PhysicsService")
+local MIST_GROUP, GIANT_GROUP = "MistBarrier", "Giants"
+for _, groupName in ipairs({ MIST_GROUP, GIANT_GROUP }) do
+	if not PhysicsService:IsCollisionGroupRegistered(groupName) then
+		PhysicsService:RegisterCollisionGroup(groupName)
+	end
+end
+PhysicsService:CollisionGroupSetCollidable(MIST_GROUP, GIANT_GROUP, false)
+
+local function collisionGroupFor(character)
+	return character:GetScale() >= MIST_PASS_SCALE and GIANT_GROUP or "Default"
+end
+
+local function setCharacterGroup(character)
+	local group = collisionGroupFor(character)
+	for _, obj in ipairs(character:GetDescendants()) do
+		if obj:IsA("BasePart") then
+			obj.CollisionGroup = group
+		end
+	end
+end
+
 local function applyHeight(player)
 	local data = playerData[player]
 	local character = player.Character
@@ -600,6 +653,7 @@ local function applyHeight(player)
 	local feetY = boxCFrame.Position.Y - boxSize.Y / 2
 
 	character:ScaleTo(scale) -- Roblox's built-in "resize the whole model"
+	setCharacterGroup(character)
 
 	humanoid.HipHeight = character:GetAttribute("BaseHipHeight") * scale
 	humanoid.WalkSpeed = math.clamp(BASE_WALKSPEED * scale ^ WALKSPEED_EXPONENT, BASE_WALKSPEED, MAX_WALKSPEED)
@@ -649,6 +703,11 @@ local function updateVipTag(player)
 end
 
 local function onCharacterAdded(player, character)
+	character.DescendantAdded:Connect(function(obj) -- hats etc. that load late
+		if obj:IsA("BasePart") then
+			obj.CollisionGroup = collisionGroupFor(character)
+		end
+	end)
 	character:WaitForChild("Humanoid")
 	-- Wait (max 5s) for hats/hair to load so they get resized too.
 	local waited = 0
@@ -744,7 +803,7 @@ local function computeLuck(player)
 			bonus(VIP_BOOST, ("VIP +%d%%"):format(pct(VIP_BOOST)))
 		end
 		if fx.throne then
-			bonus(THRONE_LUCK, ("Titan's Throne +%d%%"):format(pct(THRONE_LUCK)))
+			bonus(THRONE_LUCK, ("Apex Luck +%d%%"):format(pct(THRONE_LUCK)))
 		elseif throneTaken then
 			bonus(FAVOR_LUCK, ("Titan's Favor +%d%%"):format(pct(FAVOR_LUCK)))
 		end
@@ -1105,8 +1164,8 @@ local function isOverClouds(character)
 end
 
 ---------------------------------------------------------------------
--- TITAN'S THRONE (tag "ApexPedestal"): a 100x+ player standing on it gets
--- +50% luck, and everyone else gets +10% "Titan's Favor" while it's taken
+-- TITAN'S THRONE (tag "ApexPedestal", Y = 950): a 50x+ player standing on it
+-- gets +50% Apex Luck, and everyone else gets +10% "Titan's Favor" while it's taken
 ---------------------------------------------------------------------
 local throneRay = RaycastParams.new()
 throneRay.FilterType = Enum.RaycastFilterType.Include
@@ -1167,6 +1226,98 @@ for _, pad in ipairs(CollectionService:GetTagged("WindLauncher")) do
 	connectLauncher(pad)
 end
 CollectionService:GetInstanceAddedSignal("WindLauncher"):Connect(connectLauncher)
+
+---------------------------------------------------------------------
+-- UPDRAFT VOID CATCHER: a normal-sized player who falls off a cloud is
+-- caught by a soft updraft once they drop below CATCH_Y, then set down at
+-- the spawn plaza instead of free-falling all the way to the grass
+---------------------------------------------------------------------
+-- What's under the feet? (The server can't trust Humanoid.FloorMaterial: each
+-- client simulates its own character, so we look with a ray instead.)
+local floorRay = RaycastParams.new()
+floorRay.FilterType = Enum.RaycastFilterType.Exclude
+floorRay.RespectCanCollide = true -- see-through cloud puffs don't count as floor
+
+local function plazaPoint()
+	local spawn = workspace:FindFirstChildOfClass("SpawnLocation")
+	return spawn and spawn.Position + Vector3.new(0, spawn.Size.Y / 2, 0) or Vector3.zero
+end
+
+local function catchFall(player, fx, character, root, humanoid)
+	fx.catching = true
+	fx.cloudFeetY = nil
+	-- the server takes over the character's physics for the catch, so the
+	-- updraft grabs it right away instead of a network round trip later
+	pcall(root.SetNetworkOwner, root, nil)
+	local fallSpeed = root.AssemblyLinearVelocity.Y * 0.5 -- halve the fall at once, then ease into the float
+	local lift = Instance.new("BodyVelocity") -- eases the fall into a gentle upward float
+	lift.Name = "UpdraftCatch"
+	lift.MaxForce = Vector3.one * 1e7
+	lift.Velocity = Vector3.new(0, fallSpeed, 0)
+	lift.Parent = root
+	task.spawn(function()
+		for step = 1, 5 do
+			task.wait(0.04)
+			lift.Velocity = Vector3.new(0, fallSpeed + (8 - fallSpeed) * step / 5, 0)
+		end
+	end)
+	local wind = Instance.new("ParticleEmitter")
+	wind.Name = "UpdraftCatch"
+	wind.Texture = SPARKLE_TEXTURE
+	wind.Color = ColorSequence.new(Color3.fromRGB(200, 235, 255))
+	wind.LightEmission = 0.6
+	wind.Orientation = Enum.ParticleOrientation.VelocityParallel
+	wind.Squash = NumberSequence.new(2)
+	wind.Transparency = NumberSequence.new(0.2, 1)
+	wind.Size = NumberSequence.new(1.2, 0)
+	wind.Lifetime = NumberRange.new(0.6, 1)
+	wind.Rate = 60
+	wind.Speed = NumberRange.new(25, 40)
+	wind.EmissionDirection = Enum.NormalId.Top
+	wind.SpreadAngle = Vector2.new(25, 25)
+	wind.Parent = root
+	tell(player, "An updraft caught you!  Floating back to the plaza...", SKY_BLUE)
+	task.delay(1.6, function()
+		lift:Destroy()
+		wind:Destroy()
+		if character.Parent and humanoid.Health > 0 then
+			local feetOffset = root.Size.Y / 2 + humanoid.HipHeight
+			root.AssemblyLinearVelocity = Vector3.zero
+			character:PivotTo(CFrame.new(plazaPoint() + Vector3.new(0, feetOffset + 0.5, 0)))
+			pcall(root.SetNetworkOwner, root, player)
+		end
+		fx.catching = false
+	end)
+end
+
+task.spawn(function()
+	while true do
+		task.wait(0.1)
+		local characters = {}
+		for _, player in ipairs(Players:GetPlayers()) do
+			table.insert(characters, player.Character)
+		end
+		floorRay.FilterDescendantsInstances = characters
+		for player, fx in pairs(effects) do
+			local character = player.Character
+			local root = character and character:FindFirstChild("HumanoidRootPart")
+			local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+			if root and humanoid and humanoid.Health > 0 and skyRealm and not fx.catching then
+				local feetOffset = root.Size.Y / 2 + humanoid.HipHeight
+				local feetY = root.Position.Y - feetOffset
+				local floor = workspace:Raycast(root.Position, Vector3.new(0, -(feetOffset + 4), 0), floorRay)
+				if character:GetScale() >= CATCH_MAX_SCALE then
+					fx.cloudFeetY = nil
+				elseif floor then
+					-- standing: on a cloud (remember how high) or on the ground (forget)
+					fx.cloudFeetY = floor.Instance:IsDescendantOf(skyRealm) and feetY or nil
+				elseif fx.cloudFeetY and feetY < math.min(CATCH_Y, fx.cloudFeetY - CATCH_DROP) and root.AssemblyLinearVelocity.Y < 0 then
+					catchFall(player, fx, character, root, humanoid)
+				end
+			end
+		end
+	end
+end)
 
 -- Twice a second: update the throne, end Sky Blessings for anyone who left
 -- the clouds, and refresh everyone's luck badge (timers count down).
@@ -1299,6 +1450,9 @@ local function spinWheelFor(player)
 	fx.wheelBusy = true
 	local index = pickWheelSegment()
 	spinWheelModel(index)
+	if wheelModel then
+		wheelModel:SetAttribute("SpinStarted", workspace:GetServerTimeNow()) -- clients ripple the platform floor
+	end
 	local swirl = wheelModel and wheelModel:FindFirstChild("SpinSwirl", true) -- glyphs swirling around the platform
 	if swirl then
 		swirl.Enabled = true

@@ -42,10 +42,11 @@ local player = Players.LocalPlayer
 ---------------------------------------------------------------------
 local FONT = Enum.Font.FredokaOne
 local POPUP_HOLD_TIME = 2.5 -- how long the result stays on screen
-local BIG_REVEAL_ONE_IN = 1000 -- flash + strong shake at this rarity or rarer
-local SMALL_REVEAL_ONE_IN = 100 -- light shake at this rarity or rarer
+local BIG_REVEAL_ONE_IN = 1000 -- the rare chime at this rarity or rarer
+local FLASH_REVEAL_ONE_IN = 100 -- rarer than this: a crisp 0.3s camera-shake pulse + screen flash
 local AUTO_ROLL_INTERVAL = 1.5 -- seconds between auto-rolls
-local FAST_AUTO_ROLL_INTERVAL = 0.45 -- with the Fast Roll pass
+local FAST_AUTO_ROLL_INTERVAL = 0.75 -- with the Fast Roll pass
+local GLYPH_MIN_SCALE = 50 -- characters this big get a spinning glyph on the ground under them
 local FOOTSTEP_MIN_SCALE = 10 -- characters this big (or bigger) shake the ground
 local SHOCKWAVE_MIN_SCALE = 150 -- god tiers send a shockwave ring out on every footstep
 local STOMP_MIN_SCALE = 50 -- F key / STOMP button
@@ -55,23 +56,34 @@ local MAX_CAMERA_ZOOM = 2500
 local HIGH_TIER_MIN_SCALE = 35 -- Colossus and up get the cinematic reveal sound
 
 -- Sound effects: Roblox UI sounds and Roblox-licensed Pro Sound Effects /
--- APM Music audio. Empty string = no sound.
+-- APM Music audio. Empty string = no sound. Every UI / result sound plays
+-- as a 2D sound (SoundService:PlayLocalSound), and each one here was
+-- measured to be balanced left/right, so it lands dead-center in both ears.
 local SOUNDS = {
 	tick = "rbxassetid://15675059323", -- each step of the roll spin and the Growth Spinner (Roblox UI bright click)
-	reveal = "rbxassetid://9114619050", -- normal result (Pro Sound Effects glass tinks)
-	rare = "rbxassetid://9114618734", -- rare reveal / server announcement (Pro Sound Effects glass tinks)
+	reveal = "rbxassetid://15675085146", -- normal result (Roblox UI indicator chime)
+	rare = "rbxassetid://1841209900", -- 1 in 1,000+ reveal / server announcement (APM "Cheerful Chimes")
 	drop = "rbxassetid://9126009582", -- Colossus+ reveal: sub-bass drop (Pro Sound Effects subwoofer impact)
-	riser = "rbxassetid://9113122722", -- Colossus+ reveal: shimmer on top (Pro Sound Effects angel sparkle)
+	riser = "rbxassetid://9125635285", -- Colossus+ reveal: shimmer on top (Pro Sound Effects sparkling chimes)
 	click = "rbxassetid://15675059323", -- UI buttons (Roblox UI bright click)
 	footstep = "rbxassetid://9126009589", -- giant footsteps (Pro Sound Effects subwoofer impact, pitched down + reverb)
-	stomp = "rbxassetid://1841351403", -- Ground Shaker Stomp (APM metal crash hit)
-	launch = "rbxassetid://9113840530", -- Wind Launcher whoosh (Pro Sound Effects)
+	stomp = "rbxassetid://9043341776", -- Titan Stomp: sub-bass shockwave boom (APM "Sine Boom")
+	launch = "rbxassetid://9113840530", -- Updraft Launcher whoosh (Pro Sound Effects)
 }
 -- Sounds that get a reverb tail in the world.
 local REVERB_SOUNDS = { footstep = true, stomp = true }
--- Background music: Roblox-licensed anime lo-fi tracks (DistroKid), played in order on a loop.
-local MUSIC = { "rbxassetid://136995974791747", "rbxassetid://89791562526654" }
+-- Background music: Roblox-licensed tracks (DistroKid), shuffled without
+-- repeats and crossfaded. gain evens out how loud each track was mastered.
+local MUSIC = {
+	{ id = "rbxassetid://136995974791747", gain = 1 }, -- Memories Beyond the Journey (anime lo-fi)
+	{ id = "rbxassetid://89791562526654", gain = 1 }, -- Dreaming of Vinland (anime lo-fi)
+	{ id = "rbxassetid://139421275515323", gain = 1.15 }, -- Neon Skyline (synthwave)
+	{ id = "rbxassetid://121013346303842", gain = 0.85 }, -- Electronic Palm Shadows (synthwave)
+	{ id = "rbxassetid://138551890276730", gain = 0.7 }, -- Adrenaline Arcade Synthwave
+	{ id = "rbxassetid://140486290054589", gain = 1.6 }, -- Insert Coin (synthwave)
+}
 local MUSIC_VOLUME = 0.15
+local MUSIC_CROSSFADE = 1 -- seconds
 
 -- The player's SETTINGS (loaded from their save, see AUDIO & SETTINGS).
 local settings = { music = true, sfx = true, lowGfx = false }
@@ -106,6 +118,45 @@ local function tween(obj, time, props, style, direction)
 	)
 	t:Play()
 	return t
+end
+
+-- Menus (Index, Shop, Settings) open and close with a quick 0.2s slide +
+-- grow (Quad, Out). Each panel remembers its normal position and size.
+local PANEL_TIME = 0.2
+local panelHome = {} -- [panel] = { position, size, uiScale, open, token }
+local function setPanelOpen(panel, open)
+	local home = panelHome[panel]
+	if not home then
+		home = { position = panel.Position, size = panel.Size, open = false, token = 0 }
+		home.uiScale = make("UIScale", { Parent = panel })
+		panelHome[panel] = home
+	end
+	if home.open == open then
+		return
+	end
+	home.open = open
+	home.token += 1
+	local token = home.token
+	local shrunk = UDim2.new(home.size.X.Scale * 0.9, home.size.X.Offset * 0.9, home.size.Y.Scale * 0.9, home.size.Y.Offset * 0.9)
+	local lowered = home.position + UDim2.fromOffset(0, 24)
+	if open then
+		panel.Position, panel.Size, home.uiScale.Scale = lowered, shrunk, 0.9
+		panel.Visible = true
+		panel:TweenSizeAndPosition(home.size, home.position, Enum.EasingDirection.Out, Enum.EasingStyle.Quad, PANEL_TIME, true)
+		tween(home.uiScale, PANEL_TIME, { Scale = 1 })
+	else
+		panel:TweenSizeAndPosition(shrunk, lowered, Enum.EasingDirection.Out, Enum.EasingStyle.Quad, PANEL_TIME, true)
+		tween(home.uiScale, PANEL_TIME, { Scale = 0.9 })
+		task.delay(PANEL_TIME, function()
+			if home.token == token then
+				panel.Visible = false
+			end
+		end)
+	end
+end
+
+local function isPanelOpen(panel)
+	return panelHome[panel] ~= nil and panelHome[panel].open
 end
 
 local soundCache = {}
@@ -480,8 +531,8 @@ end)
 ---------------------------------------------------------------------
 local function doFlash(color)
 	flash.BackgroundColor3 = color
-	flash.BackgroundTransparency = 0.1
-	tween(flash, 0.6, { BackgroundTransparency = 1 })
+	flash.BackgroundTransparency = 0.2
+	tween(flash, 0.3, { BackgroundTransparency = 1 })
 end
 
 local function shake(duration, strength)
@@ -517,7 +568,7 @@ end
 
 ---------------------------------------------------------------------
 -- TIER EFFECTS drawn on this screen only (not replicated): the spinning
--- ground glyph under "Lightning" tiers, the orbiting void around "Super",
+-- ground glyph under 50x+ characters, the orbiting void around "Super",
 -- footstep and stomp shockwaves, flickering arcs and pulsing lights.
 -- Low GFX mode skips other players' effects.
 ---------------------------------------------------------------------
@@ -536,16 +587,20 @@ local function effectPart(props)
 	return make("Part", props)
 end
 
+local GLYPH_TRANSPARENCY = 0.4
+
 local function buildOrbiters(aura, scale)
 	local parts, specs = {}, {}
-	if aura == "Lightning" then
-		-- energy glyph on the ground: an outer ring and a six-sided star, counter-spinning
+	if scale >= GLYPH_MIN_SCALE then
+		-- flat neon magic circle on the ground: an outer ring and a six-sided
+		-- star, counter-spinning (violet for the Super aura, cyan/gold otherwise)
+		local super = aura == "Super"
 		for i = 1, 16 do
 			table.insert(parts, effectPart({
 				Size = Vector3.new(0.9 * scale, 0.2, 0.12 * scale),
 				Material = Enum.Material.Neon,
-				Color = Color3.fromRGB(150, 220, 255),
-				Transparency = 0.4,
+				Color = super and Color3.fromRGB(150, 80, 255) or Color3.fromRGB(150, 220, 255),
+				Transparency = GLYPH_TRANSPARENCY,
 			}))
 			table.insert(specs, { ground = true, radius = 2.2 * scale, angle = i / 16 * math.pi * 2, speed = 0.5 })
 		end
@@ -553,12 +608,13 @@ local function buildOrbiters(aura, scale)
 			table.insert(parts, effectPart({
 				Size = Vector3.new(1.9 * scale, 0.2, 0.1 * scale),
 				Material = Enum.Material.Neon,
-				Color = Color3.fromRGB(255, 220, 120),
-				Transparency = 0.4,
+				Color = super and Color3.fromRGB(255, 60, 110) or Color3.fromRGB(255, 220, 120),
+				Transparency = GLYPH_TRANSPARENCY,
 			}))
 			table.insert(specs, { ground = true, radius = 1.1 * scale, angle = i / 6 * math.pi * 2, speed = -0.8 })
 		end
-	elseif aura == "Super" then
+	end
+	if aura == "Super" then
 		-- orbiting void: two tilted rings of dark violet orbs
 		for ring = 1, 2 do
 			for i = 1, 18 do
@@ -604,7 +660,7 @@ RunService.RenderStepped:Connect(function(dt)
 			clearOrbiters(other)
 			o = nil
 		end
-		if not o and not skip and (aura == "Lightning" or aura == "Super") then
+		if not o and not skip and aura and (scale >= GLYPH_MIN_SCALE or aura == "Super") then
 			local parts, specs = buildOrbiters(aura, scale)
 			o = { character = character, aura = aura, scale = scale, parts = parts, specs = specs, t = 0 }
 			orbiters[other] = o
@@ -613,13 +669,15 @@ RunService.RenderStepped:Connect(function(dt)
 			o.t += dt
 			local humanoid = character:FindFirstChildOfClass("Humanoid")
 			local groundY = root.Position.Y - root.Size.Y / 2 - (humanoid and humanoid.HipHeight or 0) + 0.3
+			local airborne = humanoid and humanoid.FloorMaterial == Enum.Material.Air
 			for i, part in ipairs(o.parts) do
 				local spec = o.specs[i]
 				local a = spec.angle + o.t * spec.speed
 				if spec.ground then
-					-- lying flat on the ground, along the circle
+					-- lying flat on the ground, along the circle; hidden while jumping / falling
 					local pos = Vector3.new(root.Position.X + math.cos(a) * spec.radius, groundY, root.Position.Z + math.sin(a) * spec.radius)
 					part.CFrame = CFrame.new(pos) * CFrame.Angles(0, -a - math.pi / 2, 0)
+					part.Transparency = airborne and 1 or GLYPH_TRANSPARENCY
 				else
 					local offset = CFrame.Angles(spec.tilt, 0, 0) * Vector3.new(math.cos(a) * spec.radius, 0, math.sin(a) * spec.radius)
 					part.CFrame = CFrame.new(root.Position + offset)
@@ -630,30 +688,55 @@ RunService.RenderStepped:Connect(function(dt)
 end)
 Players.PlayerRemoving:Connect(clearOrbiters)
 
--- Lightning arcs keep re-bending (crackle) and Super auras' lights pulse.
--- Low GFX mode switches off other players' aura particles, lights and arcs.
+-- Every 0.1s the lightning arcs jump to a new random pair of limbs and
+-- re-bend (crackle), outlines pulse between their two colors and Super
+-- auras' lights pulse. Low GFX mode switches off other players' aura
+-- particles and lights, and every Beam and Highlight (yours too).
 local crackleRng = Random.new()
 local function setAuraEnabled(obj, enabled)
-	if obj:IsA("ParticleEmitter") or obj:IsA("Light") or obj:IsA("Highlight") then
+	if obj:IsA("ParticleEmitter") or obj:IsA("Light") then
 		obj.Enabled = enabled
 	end
 end
+
+local function arcPointsOf(character)
+	local points = {}
+	for _, obj in ipairs(character:GetDescendants()) do
+		if obj:IsA("Attachment") and obj:GetAttribute("ArcPoint") then
+			table.insert(points, obj)
+		end
+	end
+	return points
+end
+
 task.spawn(function()
 	while true do
-		task.wait(0.06)
+		task.wait(0.1)
 		local now = os.clock()
 		for _, other in ipairs(Players:GetPlayers()) do
 			local character = other.Character
 			local root = character and character:FindFirstChild("HumanoidRootPart")
 			if root then
 				local show = not (settings.lowGfx and other ~= player)
+				local showBeams = not settings.lowGfx
+				local points = nil
 				for _, obj in ipairs(root:GetChildren()) do
 					if obj.Name == "HeightAura" then
 						if obj:IsA("Beam") then
 							local s = obj:GetAttribute("Crackle") or 1
+							points = points or arcPointsOf(character)
+							if #points >= 2 then
+								local a = crackleRng:NextInteger(1, #points)
+								local b = crackleRng:NextInteger(1, #points - 1)
+								if b >= a then
+									b += 1
+								end
+								obj.Attachment0, obj.Attachment1 = points[a], points[b]
+							end
 							obj.CurveSize0 = crackleRng:NextNumber(-1.5, 1.5) * s
 							obj.CurveSize1 = crackleRng:NextNumber(-1.5, 1.5) * s
-							obj.Enabled = show and crackleRng:NextNumber() < 0.8
+							obj.TextureSpeed = crackleRng:NextNumber(2, 6)
+							obj.Enabled = showBeams and crackleRng:NextNumber() < 0.85
 						elseif obj:IsA("PointLight") and obj:GetAttribute("Pulse") then
 							obj.Brightness = 2 + 1.5 * math.sin(now * 4)
 							obj.Enabled = show
@@ -666,8 +749,12 @@ task.spawn(function()
 					end
 				end
 				local highlight = character:FindFirstChild("HeightAura")
-				if highlight then
-					setAuraEnabled(highlight, show)
+				if highlight and highlight:IsA("Highlight") then
+					highlight.Enabled = showBeams
+					local a, b = highlight:GetAttribute("OutlineA"), highlight:GetAttribute("OutlineB")
+					if a and b then
+						highlight.OutlineColor = a:Lerp(b, 0.5 + 0.5 * math.sin(now * 2.5))
+					end
 				end
 			end
 		end
@@ -798,20 +885,18 @@ local function reveal(tierId, scale, isNewBest, essence)
 	newBestLabel:FindFirstChildOfClass("UIStroke").Transparency = showNewBest and 0 or 1
 
 	pop(0.3, 0.4)
+	if rarity > FLASH_REVEAL_ONE_IN then
+		-- crisp 0.3s pulse; harder for rarer tiers
+		doFlash(tier.color)
+		shake(0.3, tier.scale >= HIGH_TIER_MIN_SCALE and 1.6 or rarity >= BIG_REVEAL_ONE_IN and 1.2 or 0.8)
+	end
 	if tier.scale >= HIGH_TIER_MIN_SCALE then
-		doFlash(tier.color)
-		shake(0.7, 1.2)
 		playSound("drop", 1, 0.85)
-		playSound("riser", 0.6)
+		playSound("riser", 0.7)
 	elseif rarity >= BIG_REVEAL_ONE_IN then
-		doFlash(tier.color)
-		shake(0.7, 1.2)
-		playSound("rare", 0.7)
-	elseif rarity >= SMALL_REVEAL_ONE_IN then
-		shake(0.3, 0.4)
-		playSound("reveal", 0.55)
+		playSound("rare", 0.6)
 	else
-		playSound("reveal", 0.45)
+		playSound("reveal", rarity > FLASH_REVEAL_ONE_IN and 0.6 or 0.45)
 	end
 
 	local myToken = popupToken
@@ -1028,14 +1113,31 @@ table.sort(indexOrder, function(a, b)
 	return a < b
 end)
 
-local indexRows = {} -- [tierId] = { name, info, button, canEquip }
+-- Every row is color-coded by rarity class (RarityTable.Classes): grey
+-- Common, blue Rare, purple Epic, gold Colossal, prismatic violet/red Mythic.
+local ROW_BASE = Color3.fromRGB(30, 30, 46)
+local function prismatic(class)
+	return make("UIGradient", { Color = ColorSequence.new(class.color, class.color2), Rotation = 0 })
+end
+
+local indexRows = {} -- [tierId] = { name, info, button, canEquip, class }
 for order, id in ipairs(indexOrder) do
+	local class = RarityTable.ClassOf(id)
+	local rowStroke = stroke(2, class.color2 and Color3.new(1, 1, 1) or class.color)
 	local row = make("Frame", {
 		LayoutOrder = order,
 		Size = UDim2.new(1, -8, 0, 54),
-		BackgroundColor3 = Color3.fromRGB(35, 35, 52),
+		BackgroundColor3 = class.color2 and Color3.new(1, 1, 1) or ROW_BASE:Lerp(class.color, 0.22),
 		Parent = indexList,
-	}, { corner(10) })
+	}, { corner(10), rowStroke })
+	if class.color2 then
+		-- Mythic: a dark violet -> red background and a prismatic border
+		make("UIGradient", {
+			Color = ColorSequence.new(ROW_BASE:Lerp(class.color, 0.35), ROW_BASE:Lerp(class.color2, 0.35)),
+			Parent = row,
+		})
+		prismatic(class).Parent = rowStroke
+	end
 	local entry = {
 		name = make("TextLabel", {
 			Position = UDim2.new(0, 12, 0, 4),
@@ -1066,7 +1168,11 @@ for order, id in ipairs(indexOrder) do
 			Parent = row,
 		}, { corner(10) }),
 		canEquip = false,
+		class = class,
 	}
+	if class.color2 then
+		prismatic(class).Parent = entry.name
+	end
 	entry.button.Activated:Connect(function()
 		if entry.canEquip and not rolling then
 			equipTier:FireServer(id)
@@ -1085,11 +1191,14 @@ local function refreshIndex()
 	for id, entry in pairs(indexRows) do
 		local tier = Tiers[id]
 		local scale = discovered[tier.name]
+		local class = entry.class
+		-- the name takes its rarity color (Mythic: white text under the prismatic gradient)
+		local classColor = class.color2 and Color3.new(1, 1, 1) or class.color
 		if scale then
 			found += 1
 			entry.name.Text = tier.name:upper()
-			entry.name.TextColor3 = tier.color
-			entry.info.Text = ("%s  •  best %s"):format(RarityTable.FormatOdds(id), RarityTable.FormatScale(scale))
+			entry.name.TextColor3 = classColor
+			entry.info.Text = ("%s  •  %s  •  best %s"):format(class.name:upper(), RarityTable.FormatOdds(id), RarityTable.FormatScale(scale))
 			entry.button.Visible = true
 			entry.canEquip = id ~= current
 			entry.button.Text = entry.canEquip and "EQUIP" or "EQUIPPED"
@@ -1097,8 +1206,8 @@ local function refreshIndex()
 			entry.button.AutoButtonColor = entry.canEquip
 		else
 			entry.name.Text = "???"
-			entry.name.TextColor3 = Color3.fromRGB(110, 110, 130)
-			entry.info.Text = "Not discovered yet"
+			entry.name.TextColor3 = classColor:Lerp(Color3.fromRGB(60, 60, 75), 0.45)
+			entry.info.Text = ("%s  •  Not discovered yet"):format(class.name:upper())
 			entry.button.Visible = false
 			entry.canEquip = false
 		end
@@ -1107,10 +1216,10 @@ local function refreshIndex()
 end
 
 indexButton.Activated:Connect(function()
-	indexPanel.Visible = not indexPanel.Visible
+	setPanelOpen(indexPanel, not isPanelOpen(indexPanel))
 end)
 closeButton.Activated:Connect(function()
-	indexPanel.Visible = false
+	setPanelOpen(indexPanel, false)
 end)
 player:GetAttributeChangedSignal("Discovered"):Connect(refreshIndex)
 player:GetAttributeChangedSignal("HeightTier"):Connect(refreshIndex)
@@ -1232,7 +1341,7 @@ refreshWheelButton()
 local PASSES = {
 	{ key = "AutoRoll", name = "Auto Roll", desc = "Unlocks the AUTO button: rolls for you every 1.5s.", color = Color3.fromRGB(80, 200, 160) },
 	{ key = "Luck2x", name = "2x Luck", desc = "Permanently doubles your luck.", color = Color3.fromRGB(80, 220, 120) },
-	{ key = "FastRoll", name = "Fast Roll", desc = "0.4s roll cooldown and spin. Auto-roll goes 3x faster.", color = Color3.fromRGB(80, 170, 255) },
+	{ key = "FastRoll", name = "Fast Roll", desc = "A roll every 0.75s instead of 1.3s, with a snappier spin. Auto-roll goes 2x faster.", color = Color3.fromRGB(80, 170, 255) },
 	{ key = "VIP", name = "VIP Rank", desc = "+25% luck and a golden VIP tag over your head and in chat.", color = Color3.fromRGB(255, 215, 0) },
 }
 local IS_STUDIO = RunService:IsStudio()
@@ -1395,14 +1504,14 @@ end
 refreshShop()
 
 shopButton.Activated:Connect(function()
-	shopPanel.Visible = not shopPanel.Visible
-	indexPanel.Visible = false
+	setPanelOpen(shopPanel, not isPanelOpen(shopPanel))
+	setPanelOpen(indexPanel, false)
 end)
 shopClose.Activated:Connect(function()
-	shopPanel.Visible = false
+	setPanelOpen(shopPanel, false)
 end)
 indexButton.Activated:Connect(function()
-	shopPanel.Visible = false -- only one panel open at a time
+	setPanelOpen(shopPanel, false) -- only one panel open at a time
 end)
 
 ---------------------------------------------------------------------
@@ -1508,16 +1617,80 @@ end)
 -- AUDIO & SETTINGS: background music, MUTE, and the SETTINGS panel
 -- (Music / SFX / Low GFX), saved with the player's data
 ---------------------------------------------------------------------
-local music = make("Sound", { Name = "BackgroundMusic", Volume = MUSIC_VOLUME, Parent = SoundService })
-local trackIndex = 0
-local function nextTrack()
-	trackIndex = trackIndex % #MUSIC + 1
-	music.SoundId = MUSIC[trackIndex]
-	if settings.music then
-		music:Play()
+-- Two music players take turns: the next track fades in over the last
+-- MUSIC_CROSSFADE seconds of the current one. Tracks are shuffled into a
+-- "bag" and every track plays once before any repeats (never twice in a row).
+local musicPlayers = {
+	make("Sound", { Name = "BackgroundMusicA", Volume = 0, Parent = SoundService }),
+	make("Sound", { Name = "BackgroundMusicB", Volume = 0, Parent = SoundService }),
+}
+local music = musicPlayers[1] -- the one playing now
+local musicGain = 1
+local musicBag = {}
+local lastTrack = nil
+
+local function drawTrack()
+	if #musicBag == 0 then
+		for _, track in ipairs(MUSIC) do
+			table.insert(musicBag, track)
+		end
+		for i = #musicBag, 2, -1 do
+			local j = math.random(i)
+			musicBag[i], musicBag[j] = musicBag[j], musicBag[i]
+		end
+		if musicBag[#musicBag] == lastTrack and #musicBag > 1 then
+			musicBag[1], musicBag[#musicBag] = musicBag[#musicBag], musicBag[1]
+		end
 	end
+	lastTrack = table.remove(musicBag)
+	return lastTrack
 end
-music.Ended:Connect(nextTrack)
+
+local crossfading = false
+local function nextTrack()
+	local track = drawTrack()
+	local old = music
+	music = old == musicPlayers[1] and musicPlayers[2] or musicPlayers[1]
+	musicGain = track.gain
+	music.SoundId = track.id
+	music.TimePosition = 0
+	music.Volume = 0
+	if not settings.music then
+		return
+	end
+	music:Play()
+	crossfading = true
+	tween(music, MUSIC_CROSSFADE, { Volume = MUSIC_VOLUME * musicGain }, Enum.EasingStyle.Sine)
+	if old.IsPlaying then
+		tween(old, MUSIC_CROSSFADE, { Volume = 0 }, Enum.EasingStyle.Sine)
+		task.delay(MUSIC_CROSSFADE, function()
+			if old ~= music then
+				old:Stop()
+			end
+		end)
+	end
+	task.delay(MUSIC_CROSSFADE, function()
+		crossfading = false
+	end)
+end
+
+-- Start the next track a crossfade before this one ends.
+RunService.Heartbeat:Connect(function()
+	if crossfading or not settings.music or not music.IsPlaying then
+		return
+	end
+	local length = music.TimeLength
+	if length > MUSIC_CROSSFADE * 3 and music.TimePosition >= length - MUSIC_CROSSFADE then
+		nextTrack()
+	end
+end)
+for _, sound in ipairs(musicPlayers) do
+	sound.Ended:Connect(function() -- safety net if a track ends before the crossfade started
+		if sound == music and settings.music and not crossfading then
+			nextTrack()
+		end
+	end)
+end
 
 -- Low GFX: no bloom / sun rays / depth of field / shadows / cloud mist on
 -- this device (other players' auras are handled in TIER EFFECTS).
@@ -1544,30 +1717,80 @@ local function applyLowGfx()
 	end
 end
 
+local GEAR_ICON = "rbxasset://textures/ui/Settings/MenuBarIcons/GameSettingsTab.png" -- Roblox's built-in gear
+
 local muteButton = sideButton("MUTE", 24, Color3.fromRGB(90, 90, 110))
-local settingsButton = sideButton("SETTINGS", -24, Color3.fromRGB(90, 90, 110))
 muteButton.Visible = true
-settingsButton.Visible = true
+local settingsButton = make("ImageButton", {
+	AnchorPoint = Vector2.new(1, 0.5),
+	Position = UDim2.new(1, -12, 0.5, -24),
+	Size = UDim2.new(0, 44, 0, 40),
+	BackgroundColor3 = Color3.fromRGB(90, 90, 110),
+	Image = "",
+	Parent = gui,
+}, {
+	corner(12),
+	stroke(3, Color3.fromRGB(30, 30, 40)),
+	make("ImageLabel", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.new(0, 28, 0, 28),
+		BackgroundTransparency = 1,
+		Image = GEAR_ICON,
+	}),
+})
+
+-- Modal: the screen dims behind the panel; clicking the dimmed area closes it.
+local settingsBackdrop = make("TextButton", {
+	Size = UDim2.fromScale(1, 1),
+	BackgroundColor3 = Color3.new(0, 0, 0),
+	BackgroundTransparency = 1,
+	AutoButtonColor = false,
+	Text = "",
+	Visible = false,
+	ZIndex = 24,
+	Parent = gui,
+})
 
 local settingsPanel = make("Frame", {
 	AnchorPoint = Vector2.new(0.5, 0.5),
 	Position = UDim2.fromScale(0.5, 0.45),
-	Size = UDim2.new(0, 320, 0, 250),
+	Size = UDim2.new(0, 320, 0, 290),
 	BackgroundColor3 = Color3.fromRGB(20, 20, 32),
 	BackgroundTransparency = 0.05,
 	Visible = false,
 	ZIndex = 25,
 	Parent = gui,
 }, { corner(16), stroke(3, Color3.fromRGB(70, 70, 110)) })
+make("ImageLabel", {
+	Position = UDim2.new(0, 14, 0, 12),
+	Size = UDim2.new(0, 30, 0, 30),
+	BackgroundTransparency = 1,
+	Image = GEAR_ICON,
+	Parent = settingsPanel,
+})
 make("TextLabel", {
-	Position = UDim2.new(0, 16, 0, 10),
-	Size = UDim2.new(1, -70, 0, 34),
+	Position = UDim2.new(0, 52, 0, 10),
+	Size = UDim2.new(1, -106, 0, 34),
 	BackgroundTransparency = 1,
 	Font = FONT,
 	TextSize = 26,
 	TextXAlignment = Enum.TextXAlignment.Left,
 	TextColor3 = Color3.new(1, 1, 1),
 	Text = "SETTINGS",
+	Parent = settingsPanel,
+})
+make("TextLabel", {
+	Position = UDim2.new(0, 20, 0, 228),
+	Size = UDim2.new(1, -40, 0, 44),
+	BackgroundTransparency = 1,
+	Font = FONT,
+	TextSize = 14,
+	TextWrapped = true,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextYAlignment = Enum.TextYAlignment.Top,
+	TextColor3 = Color3.fromRGB(150, 150, 170),
+	Text = "Low GFX hides other players' auras, turns off beams, outlines and post-processing for a smooth 60 FPS on phones.",
 	Parent = settingsPanel,
 })
 local settingsClose = make("TextButton", {
@@ -1596,10 +1819,17 @@ local function applySettings(save)
 		if music.SoundId == "" then
 			nextTrack()
 		else
+			music.Volume = MUSIC_VOLUME * musicGain
 			music:Resume()
 		end
 	elseif not settings.music then
-		music:Pause()
+		for _, sound in ipairs(musicPlayers) do
+			if sound == music then
+				sound:Pause()
+			else
+				sound:Stop() -- a track that was fading out
+			end
+		end
 	end
 	applyLowGfx()
 	refreshSettingsUi()
@@ -1608,7 +1838,7 @@ local function applySettings(save)
 	end
 end
 
-for row, entry in ipairs({ { "music", "Music" }, { "sfx", "Sound Effects" }, { "lowGfx", "Low GFX Mode" } }) do
+for row, entry in ipairs({ { "music", "Music" }, { "sfx", "SFX" }, { "lowGfx", "Low GFX Mode" } }) do
 	local key, label = entry[1], entry[2]
 	make("TextLabel", {
 		Position = UDim2.new(0, 20, 0, 54 + (row - 1) * 60),
@@ -1637,11 +1867,26 @@ for row, entry in ipairs({ { "music", "Music" }, { "sfx", "Sound Effects" }, { "
 	toggleButtons[key] = button
 end
 
+local function setSettingsOpen(open)
+	setPanelOpen(settingsPanel, open)
+	if open then
+		settingsBackdrop.Visible = true
+	end
+	tween(settingsBackdrop, PANEL_TIME, { BackgroundTransparency = open and 0.55 or 1 })
+	task.delay(PANEL_TIME, function()
+		if not isPanelOpen(settingsPanel) then
+			settingsBackdrop.Visible = false
+		end
+	end)
+end
 settingsButton.Activated:Connect(function()
-	settingsPanel.Visible = not settingsPanel.Visible
+	setSettingsOpen(not isPanelOpen(settingsPanel))
 end)
 settingsClose.Activated:Connect(function()
-	settingsPanel.Visible = false
+	setSettingsOpen(false)
+end)
+settingsBackdrop.Activated:Connect(function()
+	setSettingsOpen(false)
 end)
 muteButton.Activated:Connect(function()
 	local anyOn = settings.music or settings.sfx
@@ -1666,11 +1911,25 @@ player:GetAttributeChangedSignal("Settings"):Connect(loadSettings)
 loadSettings()
 
 ---------------------------------------------------------------------
--- GROWTH SPINNER ticks: a click each time a slice passes the pointer
+-- GROWTH SPINNER ticks: a click each time a slice passes the pointer,
+-- and energy ripples running across the platform floor while it spins
 ---------------------------------------------------------------------
 task.spawn(function()
 	local lobby = workspace:WaitForChild("Lobby", 30)
 	local spinner = lobby and lobby:WaitForChild("GrowthSpinner", 30)
+	local platform = spinner and spinner:WaitForChild("Platform", 30)
+	if spinner and platform then
+		spinner:GetAttributeChangedSignal("SpinStarted"):Connect(function()
+			if settings.lowGfx then
+				return
+			end
+			local radius = math.max(platform.Size.Y, platform.Size.Z) / 2
+			local center = platform.Position + Vector3.new(0, platform.Size.X / 2, 0)
+			for _, delay in ipairs({ 0, 0.35, 0.7, 1.6, 2.6 }) do
+				task.delay(delay, spawnShockwave, center, 2, radius, Color3.fromRGB(170, 140, 255))
+			end
+		end)
+	end
 	local hub = spinner and spinner:WaitForChild("Hub", 30)
 	local base = spinner and spinner:GetAttribute("BaseCFrame")
 	if not (hub and base) then

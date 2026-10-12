@@ -167,6 +167,27 @@ local function commas(n)
 	return (formatted:gsub("^,", ""))
 end
 
+-- Rarity classes: the color code used by the Index (and anything else that
+-- wants one). Picked by odds; World Eater gets its own prismatic class.
+RarityTable.Classes = {
+	{ name = "Common",   minOneIn = 0,       color = rgb(160, 165, 175) },
+	{ name = "Rare",     minOneIn = 100,     color = rgb(70, 150, 255) },
+	{ name = "Epic",     minOneIn = 3000,    color = rgb(170, 90, 255) },
+	{ name = "Colossal", minOneIn = 80000,   color = rgb(255, 200, 60) },
+	{ name = "Mythic",   minOneIn = 1000000, color = rgb(190, 60, 255), color2 = rgb(255, 30, 70) }, -- prismatic violet -> red
+}
+
+function RarityTable.ClassOf(tierId)
+	local rarity = RarityTable.Rarity(tierId)
+	local found = RarityTable.Classes[1]
+	for _, class in ipairs(RarityTable.Classes) do
+		if rarity >= class.minOneIn then
+			found = class
+		end
+	end
+	return found
+end
+
 function RarityTable.FormatOdds(tierId)
 	local oneIn = Tiers[tierId].oneIn
 	return oneIn and ("1 in " .. commas(oneIn)) or "Common"
