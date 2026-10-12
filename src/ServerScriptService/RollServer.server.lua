@@ -27,6 +27,8 @@ local SPIN_TIME = 1.2 -- how long the "slot machine" spins before the reveal
 local AUTOSAVE_INTERVAL = 90 -- seconds
 local DATASTORE_NAME = "RollYourHeight_v1" -- change this to wipe everyone's saves
 local BASE_WALKSPEED = 16
+local WALKSPEED_EXPONENT = 0.45 -- WalkSpeed = 16 x scale^0.45, between 16 and MAX_WALKSPEED
+local MAX_WALKSPEED = 120
 local BASE_JUMP_HEIGHT = 7.2
 local FRIEND_BOOST_PER_FRIEND = 0.10 -- +10% luck per Roblox friend in the same server
 local FRIEND_BOOST_MAX = 0.50 -- capped at +50%
@@ -66,6 +68,22 @@ local PIT_BOUNCE_COOLDOWN = 1.5 -- seconds before the same player can be bounced
 local PIT_ESSENCE_BOUNCED = 3 -- for the small player
 local PIT_ESSENCE_STOMPER = 2 -- for the giant
 local PIT_PARTICIPATION_ESSENCE = 1 -- everyone in the pit, every 10s while giants and small players share it
+
+-- Wind Launchers (tag "WindLauncher", attributes Target + FlightTime): fling normal-sized players
+local LAUNCH_MAX_SCALE = 2.5
+local LAUNCH_COOLDOWN = 3
+
+-- Titan's Throne (tag "ApexPedestal"): 100x+ players standing on it
+local THRONE_MIN_SCALE = 100
+local THRONE_LUCK = 0.5 -- +50% for the titan on the throne
+local FAVOR_LUCK = 0.10 -- +10% "Titan's Favor" for everyone else while the throne is taken
+
+-- Ground Shaker Stomp (F key)
+local STOMP_MIN_SCALE = 50
+local STOMP_COOLDOWN = 10
+local STOMP_RADIUS = 4 -- x the stomper's scale, in studs
+local STOMP_POP = 45 -- upward launch speed for popped players
+local STOMP_SIZE_RATIO = 0.1 -- only players at most a tenth of the stomper's size get popped
 
 -- Sky Realm (cloud layers, altars and orbs are built in Studio and found by tag)
 local SKY_BLESSING = 0.25 -- +25% luck after touching a Sky Altar, while you stand over a cloud
@@ -108,7 +126,10 @@ local equipTier = newRemote("EquipTier") -- client -> server: "equip this tier f
 local spinWheel = newRemote("SpinWheel") -- client -> server: "spin the Growth Spinner"
 local shopRequest = newRemote("ShopRequest") -- client -> server: "buy this pass" (Studio: toggle it)
 local notify = newRemote("Notify") -- server -> one client: a short message for the toast
-local bounce = newRemote("Bounce") -- server -> one client: "a giant just bounced you" (Crush Pit)
+local bounce = newRemote("Bounce") -- server -> one client: "fly with this velocity" (pit, stomp, launchers)
+local stomp = newRemote("Stomp") -- client -> server: "I pressed F"
+local stompFx = newRemote("StompFx") -- server -> everyone: "a giant stomped here" (boom + shockwave)
+local saveSettings = newRemote("SaveSettings") -- client -> server: music / sfx / low gfx choices
 for key, pass in pairs(GAMEPASSES) do
 	remotes:SetAttribute("PassId_" .. key, pass.id) -- the shop reads these to show prices
 end
@@ -129,6 +150,7 @@ local rng = Random.new()
 local playerData = {} -- [player] = { currentId, currentScale, bestId, bestScale, rolls, canSave }
 local lastRollTime = {} -- [player] = os.clock() of their last roll
 local effects = {} -- [player] = temporary boosts and owned passes (not saved), see newEffects()
+local throneTaken = false -- someone 100x+ is on the Titan's Throne (see TITAN'S THRONE)
 
 local function defaultData()
 	return {
@@ -138,6 +160,7 @@ local function defaultData()
 		bestScale = 1,
 		rolls = 0,
 		essence = 0, -- Growth Essence: earned from common rolls, spent on the wheel
+		settings = { music = true, sfx = true, lowGfx = false }, -- the player's SETTINGS choices
 		discovered = {}, -- [tierName] = most extreme scale rolled for that tier
 		canSave = false,
 	}
@@ -155,6 +178,9 @@ local function newEffects()
 		bonusQueue = {}, -- free rolls waiting to be played (true = fast roll)
 		bonusRunning = false,
 		lastSpinTime = 0, -- spin length of the last roll, so free rolls wait for it
+		throne = false, -- standing on the Titan's Throne
+		lastStomp = 0,
+		lastLaunch = 0,
 		wheelBusy = false,
 	}
 end
@@ -200,6 +226,7 @@ local function saveData(player)
 		rolls = data.rolls,
 		discovered = data.discovered,
 		essence = data.essence,
+		settings = data.settings,
 	}
 	local ok, err = pcall(function()
 		store:SetAsync("player_" .. player.UserId, saved)
@@ -426,6 +453,75 @@ local function addGroundDust(character, root, scale)
 	dust.Parent = feet
 end
 
+local function addOutline(character, fillColor, outlineColor)
+	local highlight = Instance.new("Highlight")
+	highlight.Name = AURA_NAME
+	highlight.FillColor = fillColor
+	highlight.FillTransparency = 0.85
+	highlight.OutlineColor = outlineColor
+	highlight.OutlineTransparency = 0
+	highlight.Adornee = character
+	highlight.Parent = character
+end
+
+-- Electric arcs: beams between random points around the body. "Crackle" tells
+-- each client to keep re-bending them so they flicker like lightning.
+local function addArcs(root, scale, color, count)
+	for _ = 1, count do
+		local a = rng:NextNumber(0, math.pi * 2)
+		local b = a + rng:NextNumber(0.6, 1.6)
+		local from = Instance.new("Attachment")
+		from.Name = AURA_NAME
+		from.Position = Vector3.new(math.cos(a) * 1.1 * scale, rng:NextNumber(-1.4, 1.4) * scale, math.sin(a) * 1.1 * scale)
+		from.Parent = root
+		local to = Instance.new("Attachment")
+		to.Name = AURA_NAME
+		to.Position = Vector3.new(math.cos(b) * 1.1 * scale, rng:NextNumber(-1.4, 1.4) * scale, math.sin(b) * 1.1 * scale)
+		to.Parent = root
+		local beam = Instance.new("Beam")
+		beam.Name = AURA_NAME
+		beam.Attachment0 = from
+		beam.Attachment1 = to
+		beam.Color = ColorSequence.new(color)
+		beam.LightEmission = 1
+		beam.LightInfluence = 0
+		beam.Width0 = 0.08 * scale
+		beam.Width1 = 0.08 * scale
+		beam.Segments = 12
+		beam.FaceCamera = true
+		beam.Transparency = NumberSequence.new(0.1)
+		beam:SetAttribute("Crackle", scale)
+		beam.Parent = root
+	end
+end
+
+-- Tall columns of dark cosmic energy rising off the body.
+local function addPillars(root, scale)
+	local pillar = Instance.new("ParticleEmitter")
+	pillar.Name = AURA_NAME
+	pillar.Texture = SMOKE_TEXTURE
+	pillar.Color = ColorSequence.new(Color3.fromRGB(110, 40, 190), Color3.fromRGB(5, 0, 15))
+	pillar.LightEmission = 0.25
+	pillar.Transparency = NumberSequence.new(0.3, 1)
+	pillar.Size = NumberSequence.new(1.2 * scale, 2 * scale)
+	pillar.Lifetime = NumberRange.new(1.5, 2.5)
+	pillar.Rate = 20
+	pillar.Speed = NumberRange.new(3 * scale, 5 * scale)
+	pillar.SpreadAngle = Vector2.new(6, 6)
+	pillar.Parent = root
+	local sparks = Instance.new("ParticleEmitter")
+	sparks.Name = AURA_NAME
+	sparks.Texture = SPARKLE_TEXTURE
+	sparks.Color = ColorSequence.new(Color3.fromRGB(200, 150, 255))
+	sparks.LightEmission = 1
+	sparks.Size = NumberSequence.new(0.4 * scale, 0)
+	sparks.Lifetime = NumberRange.new(1, 1.5)
+	sparks.Rate = 30
+	sparks.Speed = NumberRange.new(4 * scale, 7 * scale)
+	sparks.SpreadAngle = Vector2.new(10, 10)
+	sparks.Parent = root
+end
+
 local function applyAura(character, tier, scale)
 	clearAura(character)
 	local root = character:FindFirstChild("HumanoidRootPart")
@@ -444,27 +540,33 @@ local function applyAura(character, tier, scale)
 	elseif tier.aura == "Earth" then
 		-- small / common tiers: a few drifting earth-tone motes
 		addMotes(root, tier.color, scale)
-	elseif tier.aura == "Electric" then
-		-- mid tiers: electric sparks with gold accents, dust kicked up at the feet
+	elseif tier.aura == "Ki" then
+		-- anime ki: cyan/gold outline and rising flames
+		addOutline(character, Color3.fromRGB(80, 220, 255), Color3.fromRGB(255, 200, 60))
 		addLight(root, tier.color, scale)
+		addEmitter(root, FIRE_TEXTURE, tier.color, scale, 35, true)
+		addEmitter(root, FIRE_TEXTURE, Color3.fromRGB(255, 210, 90), scale * 0.7, 20, true)
+		addGroundDust(character, root, scale)
+	elseif tier.aura == "Lightning" then
+		-- crackling arcs (each client makes them flicker); the spinning ground glyph is drawn by each client
+		addOutline(character, tier.color, Color3.fromRGB(200, 240, 255))
+		addLight(root, tier.color, scale)
+		addArcs(root, scale, Color3.fromRGB(170, 225, 255), 5)
 		addEmitter(root, SPARKLE_TEXTURE, tier.color, scale, 20, false)
-		addEmitter(root, SPARKLE_TEXTURE, Color3.fromRGB(255, 210, 90), scale * 0.7, 10, false)
 		addGroundDust(character, root, scale)
-	elseif tier.aura == "Embers" then
-		addGlow(character, root, tier.color, scale)
-		addEmitter(root, FIRE_TEXTURE, tier.color, scale, 30, true)
-		addEmitter(root, SPARKLE_TEXTURE, Color3.fromRGB(255, 170, 60), scale * 0.5, 25, true) -- drifting embers
-		addGroundDust(character, root, scale)
-	elseif tier.aura == "Void" then
-		-- the void crystals orbiting the body are drawn by each client (RollClient)
-		addGlow(character, root, tier.color, scale)
-		addNebula(root, scale, Color3.fromRGB(70, 20, 110), Color3.fromRGB(15, 5, 30))
-		addGroundDust(character, root, scale)
-	elseif tier.aura == "Godly" then
-		-- the cosmic rings and footstep shockwaves are drawn by each client (RollClient)
-		addGlow(character, root, tier.color, scale)
+	elseif tier.aura == "Super" then
+		-- full super aura; the orbiting void and footstep shockwaves are drawn by each client
+		addOutline(character, Color3.fromRGB(40, 10, 70), Color3.fromRGB(170, 90, 255))
+		addPillars(root, scale)
 		addNebula(root, scale, Color3.fromRGB(90, 20, 140), Color3.fromRGB(10, 10, 40))
-		addEmitter(root, SPARKLE_TEXTURE, Color3.new(1, 1, 1), scale * 1.5, 40, false)
+		addArcs(root, scale, Color3.fromRGB(150, 70, 255), 6)
+		local pulse = Instance.new("PointLight")
+		pulse.Name = AURA_NAME
+		pulse.Color = Color3.fromRGB(150, 70, 255)
+		pulse.Brightness = 3
+		pulse.Range = 60
+		pulse:SetAttribute("Pulse", true) -- each client pulses it
+		pulse.Parent = root
 	end
 end
 
@@ -500,7 +602,7 @@ local function applyHeight(player)
 	character:ScaleTo(scale) -- Roblox's built-in "resize the whole model"
 
 	humanoid.HipHeight = character:GetAttribute("BaseHipHeight") * scale
-	humanoid.WalkSpeed = BASE_WALKSPEED * math.sqrt(scale) -- big = faster, but not 200x faster
+	humanoid.WalkSpeed = math.clamp(BASE_WALKSPEED * scale ^ WALKSPEED_EXPONENT, BASE_WALKSPEED, MAX_WALKSPEED)
 	humanoid.UseJumpPower = false
 	local fx = effects[player]
 	local jumpBoost = (fx and os.clock() < fx.skyJumpUntil) and SKY_JUMP_MULT or 1
@@ -640,6 +742,11 @@ local function computeLuck(player)
 	if fx then
 		if fx.passes.VIP then
 			bonus(VIP_BOOST, ("VIP +%d%%"):format(pct(VIP_BOOST)))
+		end
+		if fx.throne then
+			bonus(THRONE_LUCK, ("Titan's Throne +%d%%"):format(pct(THRONE_LUCK)))
+		elseif throneTaken then
+			bonus(FAVOR_LUCK, ("Titan's Favor +%d%%"):format(pct(FAVOR_LUCK)))
 		end
 		if fx.sky then
 			bonus(SKY_BLESSING, ("Sky Blessing +%d%%"):format(pct(SKY_BLESSING)))
@@ -997,11 +1104,76 @@ local function isOverClouds(character)
 	return workspace:Raycast(root.Position, Vector3.new(0, -(root.Position.Y + 10), 0), cloudRay) ~= nil
 end
 
--- Twice a second: end Sky Blessings for anyone who left the clouds, and
--- refresh everyone's luck badge (timers count down).
+---------------------------------------------------------------------
+-- TITAN'S THRONE (tag "ApexPedestal"): a 100x+ player standing on it gets
+-- +50% luck, and everyone else gets +10% "Titan's Favor" while it's taken
+---------------------------------------------------------------------
+local throneRay = RaycastParams.new()
+throneRay.FilterType = Enum.RaycastFilterType.Include
+
+local function isOnThrone(character)
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if not (root and humanoid) or humanoid.Health <= 0 or character:GetScale() < THRONE_MIN_SCALE then
+		return false
+	end
+	throneRay.FilterDescendantsInstances = CollectionService:GetTagged("ApexPedestal")
+	local reach = root.Size.Y / 2 + humanoid.HipHeight + 30 -- just below the feet
+	return workspace:Raycast(root.Position, Vector3.new(0, -reach, 0), throneRay) ~= nil
+end
+
+local function updateThrone()
+	local anyone = false
+	for player, fx in pairs(effects) do
+		local was = fx.throne
+		fx.throne = player.Parent ~= nil and isOnThrone(player.Character)
+		anyone = anyone or fx.throne
+		if fx.throne ~= was then
+			local text = fx.throne and (player.DisplayName .. " took the TITAN'S THRONE!  Everyone gets +10% Luck")
+				or (player.DisplayName .. " left the Titan's Throne.")
+			for _, other in ipairs(Players:GetPlayers()) do
+				tell(other, text, fx.throne and GOLD or GREY)
+			end
+		end
+	end
+	throneTaken = anyone
+end
+
+---------------------------------------------------------------------
+-- WIND LAUNCHERS (tag "WindLauncher"): fling normal-sized players along an
+-- arc that lands on the pad's Target after FlightTime seconds
+---------------------------------------------------------------------
+local function connectLauncher(pad)
+	pad.Touched:Connect(function(hit)
+		local player = playerFromHit(hit)
+		local fx = player and effects[player]
+		local character = player and player.Character
+		local root = character and character:FindFirstChild("HumanoidRootPart")
+		local target, flightTime = pad:GetAttribute("Target"), pad:GetAttribute("FlightTime")
+		if not (fx and root and target and flightTime) or character:GetScale() > LAUNCH_MAX_SCALE then
+			return
+		end
+		if os.clock() - fx.lastLaunch < LAUNCH_COOLDOWN then
+			return
+		end
+		fx.lastLaunch = os.clock()
+		local offset = target - root.Position
+		local g = workspace.Gravity
+		local velocity = Vector3.new(offset.X / flightTime, (offset.Y + 0.5 * g * flightTime ^ 2) / flightTime, offset.Z / flightTime)
+		bounce:FireClient(player, velocity, flightTime, "launch")
+	end)
+end
+for _, pad in ipairs(CollectionService:GetTagged("WindLauncher")) do
+	connectLauncher(pad)
+end
+CollectionService:GetInstanceAddedSignal("WindLauncher"):Connect(connectLauncher)
+
+-- Twice a second: update the throne, end Sky Blessings for anyone who left
+-- the clouds, and refresh everyone's luck badge (timers count down).
 task.spawn(function()
 	while true do
 		task.wait(0.5)
+		updateThrone()
 		for player, fx in pairs(effects) do
 			if fx.sky then
 				if not isOverClouds(player.Character) then
@@ -1127,6 +1299,13 @@ local function spinWheelFor(player)
 	fx.wheelBusy = true
 	local index = pickWheelSegment()
 	spinWheelModel(index)
+	local swirl = wheelModel and wheelModel:FindFirstChild("SpinSwirl", true) -- glyphs swirling around the platform
+	if swirl then
+		swirl.Enabled = true
+		task.delay(WHEEL_SPIN_TIME, function()
+			swirl.Enabled = false
+		end)
+	end
 	tell(player, "The Growth Spinner is spinning...", Color3.fromRGB(200, 190, 230))
 	task.delay(WHEEL_SPIN_TIME, function()
 		fx.wheelBusy = false
@@ -1142,6 +1321,62 @@ local wheelPrompt = wheelHub and wheelHub:FindFirstChildOfClass("ProximityPrompt
 if wheelPrompt then
 	wheelPrompt.Triggered:Connect(spinWheelFor)
 end
+
+---------------------------------------------------------------------
+-- GROUND SHAKER STOMP (F key, 50x+): boom + shockwave for everyone, and
+-- players a tenth of the stomper's size (or smaller) nearby get popped up
+---------------------------------------------------------------------
+stomp.OnServerEvent:Connect(function(player)
+	local fx = effects[player]
+	local character = player.Character
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if not (fx and root and humanoid) or humanoid.Health <= 0 then
+		return
+	end
+	local scale = character:GetScale()
+	if scale < STOMP_MIN_SCALE then
+		return
+	end
+	local remaining = STOMP_COOLDOWN - (os.clock() - fx.lastStomp)
+	if remaining > 0 then
+		tell(player, ("Stomp recharging: %ds"):format(math.ceil(remaining)), GREY)
+		return
+	end
+	fx.lastStomp = os.clock()
+	local ground = root.Position - Vector3.new(0, root.Size.Y / 2 + humanoid.HipHeight, 0)
+	stompFx:FireAllClients(ground, scale)
+	local popped = 0
+	for _, other in ipairs(Players:GetPlayers()) do
+		local otherCharacter = other.Character
+		local otherRoot = otherCharacter and otherCharacter:FindFirstChild("HumanoidRootPart")
+		if other ~= player and otherRoot and otherCharacter:GetScale() <= scale * STOMP_SIZE_RATIO then
+			local offset = (otherRoot.Position - ground) * Vector3.new(1, 0, 1)
+			if offset.Magnitude <= scale * STOMP_RADIUS and math.abs(otherRoot.Position.Y - ground.Y) < scale then
+				bounce:FireClient(other, Vector3.new(0, STOMP_POP, 0))
+				popped += 1
+			end
+		end
+	end
+	if popped > 0 then
+		tell(player, ("STOMP! You popped %d player%s"):format(popped, popped == 1 and "" or "s"), GOLD)
+	end
+end)
+
+---------------------------------------------------------------------
+-- SETTINGS (music / sfx / low gfx), saved with the player's data
+---------------------------------------------------------------------
+saveSettings.OnServerEvent:Connect(function(player, settings)
+	local data = playerData[player]
+	if not data or type(settings) ~= "table" then
+		return
+	end
+	for key in pairs(data.settings) do
+		if type(settings[key]) == "boolean" then
+			data.settings[key] = settings[key]
+		end
+	end
+end)
 
 ---------------------------------------------------------------------
 -- CRUSH PIT (Workspace.Lobby.CrushPit, built in Studio)
@@ -1354,6 +1589,13 @@ local function onPlayerAdded(player)
 		end
 		data.rolls = saved.rolls or 0
 		data.essence = tonumber(saved.essence) or 0
+		if type(saved.settings) == "table" then
+			for key in pairs(data.settings) do
+				if type(saved.settings[key]) == "boolean" then
+					data.settings[key] = saved.settings[key]
+				end
+			end
+		end
 		if type(saved.discovered) == "table" then
 			for name, scale in pairs(saved.discovered) do
 				if RarityTable.ByName[name] and type(scale) == "number" then
@@ -1370,6 +1612,7 @@ local function onPlayerAdded(player)
 	end
 	playerData[player] = data
 	refreshStats(player)
+	player:SetAttribute("Settings", HttpService:JSONEncode(data.settings)) -- the client applies these once on join
 	task.spawn(loadPasses, player)
 	refreshLuckInfo(player)
 

@@ -16,9 +16,10 @@
 	             that tier gets whatever chance is left over.
 	  color    - main color for text and the aura
 	  aura     - character effect. By bracket: "Earth" (small/common, earth-tone motes),
-	             "Electric" (10x+, sparks + ground dust), "Embers" / "Void" (50x+),
-	             "Godly" (150x+, cosmic rings + footstep shockwaves). Tiny rare tiers
-	             keep their own: "Sparkles", "Glow", "Cosmic". Or "None".
+	             "Ki" (10x+, outline + rising flames), "Lightning" (Colossus and up:
+	             crackling arcs + spinning ground glyph), "Super" (World Eater: cosmic
+	             pillars, orbiting void, pulsing light, dark arcs, footstep shockwaves).
+	             Tiny rare tiers keep their own: "Sparkles", "Glow", "Cosmic". Or "None".
 	  announce - true = the whole server gets a banner when someone rolls it
 ]]
 
@@ -55,15 +56,15 @@ RarityTable.Tiers = {
 	{ name = "Tree",           title = "Walking Timber",       scale = 2.5,  oneIn = 120,     color = rgb(110, 150, 80),  aura = "Earth",    announce = false },
 	{ name = "Giant",          title = "Fee-Fi-Fo-Fum",        scale = 4,    oneIn = 400,     color = rgb(215, 180, 120), aura = "Earth",    announce = false },
 	{ name = "Lighthouse",     title = "Beacon of the Coast",  scale = 7,    oneIn = 1500,    color = rgb(255, 240, 150), aura = "Glow",     announce = true },
-	-- mid tiers (10x+): electric blue / gold
-	{ name = "Skyscraper",     title = "Cloud Scraper",        scale = 12,   oneIn = 6000,    color = rgb(70, 170, 255),  aura = "Electric", announce = true },
-	{ name = "Mountain",       title = "Peak Performer",       scale = 20,   oneIn = 25000,   color = rgb(255, 200, 70),  aura = "Electric", announce = true },
-	{ name = "Colossus",       title = "Earth Shaker",         scale = 35,   oneIn = 80000,   color = rgb(90, 200, 255),  aura = "Electric", announce = true },
-	-- giant tiers (50x+): embers and void
-	{ name = "Storm Titan",    title = "Lord of Thunder",      scale = 60,   oneIn = 200000,  color = rgb(255, 120, 50),  aura = "Embers",   announce = true },
-	{ name = "Planet Breaker", title = "Moon Kicker",          scale = 100,  oneIn = 400000,  color = rgb(160, 90, 230),  aura = "Void",     announce = true },
+	-- mid tiers (10x+): cyan / gold ki
+	{ name = "Skyscraper",     title = "Cloud Scraper",        scale = 12,   oneIn = 6000,    color = rgb(70, 200, 255),  aura = "Ki",        announce = true },
+	{ name = "Mountain",       title = "Peak Performer",       scale = 20,   oneIn = 25000,   color = rgb(255, 200, 70),  aura = "Ki",        announce = true },
+	-- giant tiers (Colossus and up): lightning
+	{ name = "Colossus",       title = "Earth Shaker",         scale = 35,   oneIn = 80000,   color = rgb(120, 210, 255), aura = "Lightning", announce = true },
+	{ name = "Storm Titan",    title = "Lord of Thunder",      scale = 60,   oneIn = 200000,  color = rgb(255, 120, 50),  aura = "Lightning", announce = true },
+	{ name = "Planet Breaker", title = "Moon Kicker",          scale = 100,  oneIn = 400000,  color = rgb(160, 90, 230),  aura = "Lightning", announce = true },
 	-- god tier (150x+)
-	{ name = "World Eater",    title = "Devourer of Worlds",   scale = 200,  oneIn = 1000000, color = rgb(255, 20, 60),   aura = "Godly",    announce = true },
+	{ name = "World Eater",    title = "Devourer of Worlds",   scale = 200,  oneIn = 1000000, color = rgb(255, 20, 60),   aura = "Super",     announce = true },
 }
 
 local Tiers = RarityTable.Tiers

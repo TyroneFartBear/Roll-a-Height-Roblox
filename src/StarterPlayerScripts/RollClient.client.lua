@@ -31,6 +31,9 @@ local spinWheel = remotes:WaitForChild("SpinWheel")
 local shopRequest = remotes:WaitForChild("ShopRequest")
 local notify = remotes:WaitForChild("Notify")
 local bounce = remotes:WaitForChild("Bounce")
+local stomp = remotes:WaitForChild("Stomp")
+local stompFx = remotes:WaitForChild("StompFx")
+local saveSettings = remotes:WaitForChild("SaveSettings")
 
 local player = Players.LocalPlayer
 
@@ -44,16 +47,28 @@ local SMALL_REVEAL_ONE_IN = 100 -- light shake at this rarity or rarer
 local AUTO_ROLL_INTERVAL = 1.5 -- seconds between auto-rolls
 local FAST_AUTO_ROLL_INTERVAL = 0.45 -- with the Fast Roll pass
 local FOOTSTEP_MIN_SCALE = 10 -- characters this big (or bigger) shake the ground
-local THUD_SOUND = "rbxasset://sounds/action_footsteps_plastic.mp3" -- played slowed down = deep thud
 local SHOCKWAVE_MIN_SCALE = 150 -- god tiers send a shockwave ring out on every footstep
+local STOMP_MIN_SCALE = 50 -- F key / STOMP button
+local VIEWPORT_MIN_SCALE = 10 -- V key / VIEW button
+local MAX_CAMERA_ZOOM = 3000
 
--- Paste sound IDs from the Creator Store here, e.g. "rbxassetid://12345".
--- Left empty = no sound (nothing breaks).
+-- Sound effects: Roblox built-ins (rbxasset://) and Roblox-licensed
+-- APM Music / Pro Sound Effects audio. Empty string = no sound.
 local SOUNDS = {
-	tick = "", -- each step of the spin
-	reveal = "", -- normal result
-	rare = "", -- big reveal / server announcement
+	tick = "rbxasset://sounds/clickfast.wav", -- each step of the roll spin and the Growth Spinner
+	reveal = "rbxasset://sounds/electronicpingshort.wav", -- normal result
+	rare = "rbxassetid://1840076509", -- rare reveal / server announcement (APM "Through the Roof" sting)
+	click = "rbxasset://sounds/button.wav", -- UI buttons
+	footstep = "rbxassetid://9116908541", -- giant footsteps (Pro Sound Effects deep impact)
+	stomp = "rbxassetid://1841351403", -- Ground Shaker Stomp (APM metal crash hit)
+	launch = "rbxassetid://9113840530", -- Wind Launcher whoosh (Pro Sound Effects)
 }
+-- Background music: Roblox-licensed APM tracks, played in order on a loop.
+local MUSIC = { "rbxassetid://9046862941", "rbxassetid://9046863253", "rbxassetid://9043225696" }
+local MUSIC_VOLUME = 0.3
+
+-- The player's SETTINGS (loaded from their save, see AUDIO & SETTINGS).
+local settings = { music = true, sfx = true, lowGfx = false }
 
 ---------------------------------------------------------------------
 -- SMALL HELPERS
@@ -90,7 +105,7 @@ end
 local soundCache = {}
 local function playSound(name)
 	local id = SOUNDS[name]
-	if not id or id == "" then
+	if not id or id == "" or not settings.sfx then
 		return
 	end
 	local sound = soundCache[name]
@@ -99,6 +114,24 @@ local function playSound(name)
 		soundCache[name] = sound
 	end
 	SoundService:PlayLocalSound(sound)
+end
+
+-- A sound in the world (louder when you're closer), e.g. footsteps and stomps.
+local function play3D(name, parent, volume, speed, rollMin, rollMax)
+	local id = SOUNDS[name]
+	if not id or id == "" or not settings.sfx then
+		return
+	end
+	local sound = make("Sound", {
+		SoundId = id,
+		Volume = volume,
+		PlaybackSpeed = speed,
+		RollOffMinDistance = rollMin,
+		RollOffMaxDistance = rollMax,
+		Parent = parent,
+	})
+	sound:Play()
+	task.delay(6, sound.Destroy, sound)
 end
 
 local function escapeRichText(text)
@@ -331,21 +364,29 @@ end
 -- CAMERA: zoom out for giants, zoom in for tiny players
 ---------------------------------------------------------------------
 local function zoomFor(scale)
-	return math.max(12.5 * scale, 0.6)
+	return math.clamp(12.5 * scale, 0.6, 2500)
+end
+
+-- Giants can zoom far out (up to MAX_CAMERA_ZOOM) and can't zoom in so close
+-- that the camera ends up inside their own head or torso.
+local function cameraLimits(scale)
+	local maxZoom = math.clamp(30 * scale, 128, MAX_CAMERA_ZOOM)
+	local minZoom = scale >= 2 and 2.5 * scale or 0.5 -- normal-sized players keep first person
+	return math.min(minZoom, maxZoom), maxZoom
 end
 
 local function applyCamera(snap)
 	local scale = player:GetAttribute("HeightScale") or 1
-	local maxZoom = math.max(128, 30 * scale)
+	local minZoom, maxZoom = cameraLimits(scale)
 	player.CameraMaxZoomDistance = maxZoom
-	player.CameraMinZoomDistance = 0.5
+	player.CameraMinZoomDistance = minZoom
 	if snap then
 		-- Trick: pin min and max to the same value for a moment to force the zoom.
-		local target = zoomFor(scale)
+		local target = math.clamp(zoomFor(scale), minZoom, maxZoom)
 		player.CameraMinZoomDistance = target
 		player.CameraMaxZoomDistance = target
 		task.wait(0.05)
-		player.CameraMinZoomDistance = 0.5
+		player.CameraMinZoomDistance = minZoom
 		player.CameraMaxZoomDistance = maxZoom
 	end
 end
@@ -448,9 +489,10 @@ local function pop(fromScale, time)
 end
 
 ---------------------------------------------------------------------
--- TIER EFFECTS drawn on this screen only (not replicated): void crystals
--- orbiting "Void" tiers, cosmic rings around "Godly" tiers, and the god
--- tier's footstep shockwaves.
+-- TIER EFFECTS drawn on this screen only (not replicated): the spinning
+-- ground glyph under "Lightning" tiers, the orbiting void around "Super",
+-- footstep and stomp shockwaves, flickering arcs and pulsing lights.
+-- Low GFX mode skips other players' effects.
 ---------------------------------------------------------------------
 local fxFolder = Instance.new("Folder")
 fxFolder.Name = "LocalTierEffects"
@@ -469,25 +511,36 @@ end
 
 local function buildOrbiters(aura, scale)
 	local parts, specs = {}, {}
-	if aura == "Void" then
+	if aura == "Lightning" then
+		-- energy glyph on the ground: an outer ring and a six-sided star, counter-spinning
+		for i = 1, 16 do
+			table.insert(parts, effectPart({
+				Size = Vector3.new(0.9 * scale, 0.2, 0.12 * scale),
+				Material = Enum.Material.Neon,
+				Color = Color3.fromRGB(150, 220, 255),
+				Transparency = 0.4,
+			}))
+			table.insert(specs, { ground = true, radius = 2.2 * scale, angle = i / 16 * math.pi * 2, speed = 0.5 })
+		end
 		for i = 1, 6 do
 			table.insert(parts, effectPart({
-				Size = Vector3.new(0.5, 1.2, 0.5) * scale,
-				Material = Enum.Material.Glass,
-				Color = Color3.fromRGB(150, 90, 230),
-				Transparency = 0.25,
+				Size = Vector3.new(1.9 * scale, 0.2, 0.1 * scale),
+				Material = Enum.Material.Neon,
+				Color = Color3.fromRGB(255, 220, 120),
+				Transparency = 0.4,
 			}))
-			table.insert(specs, { radius = 2.6 * scale, angle = i / 6 * math.pi * 2, speed = 0.6, tilt = 0, bob = 0.6 * scale, spin = true })
+			table.insert(specs, { ground = true, radius = 1.1 * scale, angle = i / 6 * math.pi * 2, speed = -0.8 })
 		end
-	elseif aura == "Godly" then
+	elseif aura == "Super" then
+		-- orbiting void: two tilted rings of dark violet orbs
 		for ring = 1, 2 do
 			for i = 1, 18 do
 				table.insert(parts, effectPart({
 					Shape = Enum.PartType.Ball,
 					Size = Vector3.one * 0.3 * scale,
 					Material = Enum.Material.Neon,
-					Color = ring == 1 and Color3.fromRGB(190, 160, 255) or Color3.fromRGB(150, 220, 240),
-					Transparency = 0.5,
+					Color = ring == 1 and Color3.fromRGB(120, 60, 200) or Color3.fromRGB(70, 30, 130),
+					Transparency = 0.35,
 				}))
 				table.insert(specs, {
 					radius = (ring == 1 and 3 or 3.6) * scale,
@@ -519,44 +572,92 @@ RunService.RenderStepped:Connect(function(dt)
 		local aura = root and tier and tier.aura
 		local scale = character and character:GetScale() or 1
 		local o = orbiters[other]
-		if o and (o.character ~= character or o.aura ~= aura or math.abs(o.scale - scale) > 0.01) then
+		local skip = settings.lowGfx and other ~= player
+		if o and (skip or o.character ~= character or o.aura ~= aura or math.abs(o.scale - scale) > 0.01) then
 			clearOrbiters(other)
 			o = nil
 		end
-		if not o and (aura == "Void" or aura == "Godly") then
+		if not o and not skip and (aura == "Lightning" or aura == "Super") then
 			local parts, specs = buildOrbiters(aura, scale)
 			o = { character = character, aura = aura, scale = scale, parts = parts, specs = specs, t = 0 }
 			orbiters[other] = o
 		end
 		if o and root then
 			o.t += dt
+			local humanoid = character:FindFirstChildOfClass("Humanoid")
+			local groundY = root.Position.Y - root.Size.Y / 2 - (humanoid and humanoid.HipHeight or 0) + 0.3
 			for i, part in ipairs(o.parts) do
 				local spec = o.specs[i]
 				local a = spec.angle + o.t * spec.speed
-				local offset = CFrame.Angles(spec.tilt, 0, 0) * Vector3.new(math.cos(a) * spec.radius, 0, math.sin(a) * spec.radius)
-				if spec.bob then
-					offset += Vector3.new(0, math.sin(o.t * 1.5 + spec.angle) * spec.bob, 0)
+				if spec.ground then
+					-- lying flat on the ground, along the circle
+					local pos = Vector3.new(root.Position.X + math.cos(a) * spec.radius, groundY, root.Position.Z + math.sin(a) * spec.radius)
+					part.CFrame = CFrame.new(pos) * CFrame.Angles(0, -a - math.pi / 2, 0)
+				else
+					local offset = CFrame.Angles(spec.tilt, 0, 0) * Vector3.new(math.cos(a) * spec.radius, 0, math.sin(a) * spec.radius)
+					part.CFrame = CFrame.new(root.Position + offset)
 				end
-				local turn = spec.spin and CFrame.Angles(o.t, o.t * 0.7, 0) or CFrame.identity
-				part.CFrame = CFrame.new(root.Position + offset) * turn
 			end
 		end
 	end
 end)
 Players.PlayerRemoving:Connect(clearOrbiters)
 
--- An expanding, fading ring on the ground under a god-tier footstep.
-local function spawnShockwave(root, humanoid, scale)
-	local groundY = root.Position.Y - root.Size.Y / 2 - humanoid.HipHeight
+-- Lightning arcs keep re-bending (crackle) and Super auras' lights pulse.
+-- Low GFX mode switches off other players' aura particles, lights and arcs.
+local crackleRng = Random.new()
+local function setAuraEnabled(obj, enabled)
+	if obj:IsA("ParticleEmitter") or obj:IsA("Light") or obj:IsA("Highlight") then
+		obj.Enabled = enabled
+	end
+end
+task.spawn(function()
+	while true do
+		task.wait(0.06)
+		local now = os.clock()
+		for _, other in ipairs(Players:GetPlayers()) do
+			local character = other.Character
+			local root = character and character:FindFirstChild("HumanoidRootPart")
+			if root then
+				local show = not (settings.lowGfx and other ~= player)
+				for _, obj in ipairs(root:GetChildren()) do
+					if obj.Name == "HeightAura" then
+						if obj:IsA("Beam") then
+							local s = obj:GetAttribute("Crackle") or 1
+							obj.CurveSize0 = crackleRng:NextNumber(-1.5, 1.5) * s
+							obj.CurveSize1 = crackleRng:NextNumber(-1.5, 1.5) * s
+							obj.Enabled = show and crackleRng:NextNumber() < 0.8
+						elseif obj:IsA("PointLight") and obj:GetAttribute("Pulse") then
+							obj.Brightness = 2 + 1.5 * math.sin(now * 4)
+							obj.Enabled = show
+						else
+							setAuraEnabled(obj, show)
+							for _, child in ipairs(obj:GetChildren()) do
+								setAuraEnabled(child, show)
+							end
+						end
+					end
+				end
+				local highlight = character:FindFirstChild("HeightAura")
+				if highlight then
+					setAuraEnabled(highlight, show)
+				end
+			end
+		end
+	end
+end)
+
+-- An expanding, fading ring on the ground (footsteps, stomps).
+local function spawnShockwave(position, scale, reach, color)
 	local ring = effectPart({
 		Shape = Enum.PartType.Cylinder,
 		Size = Vector3.new(0.4, scale * 0.5, scale * 0.5),
-		CFrame = CFrame.new(root.Position.X, groundY + 0.5, root.Position.Z) * CFrame.Angles(0, 0, math.rad(90)),
+		CFrame = CFrame.new(position + Vector3.new(0, 0.5, 0)) * CFrame.Angles(0, 0, math.rad(90)),
 		Material = Enum.Material.Neon,
-		Color = Color3.fromRGB(200, 170, 255),
+		Color = color or Color3.fromRGB(200, 170, 255),
 		Transparency = 0.5,
 	})
-	tween(ring, 1.2, { Size = Vector3.new(0.4, scale * 10, scale * 10), Transparency = 1 })
+	tween(ring, 1.2, { Size = Vector3.new(0.4, scale * reach, scale * reach), Transparency = 1 })
 	task.delay(1.3, ring.Destroy, ring)
 end
 
@@ -582,28 +683,20 @@ RunService.Heartbeat:Connect(function(dt)
 			and humanoid.MoveDirection.Magnitude > 0.1
 			and humanoid.FloorMaterial ~= Enum.Material.Air
 		if walking then
-			-- bigger strides = slower steps (0.35s at 1x, ~1.1s at 10x, ~5s at 200x)
-			local interval = 0.35 * math.sqrt(scale)
+			-- stride grows with size, speed is capped: bigger = slower steps (max 4s apart)
+			local interval = math.min(0.35 * scale * 16 / math.max(humanoid.WalkSpeed, 1), 4)
 			local t = (stepTimers[other] or interval) + dt
 			if t >= interval then
 				t = 0
-				if scale >= SHOCKWAVE_MIN_SCALE then
-					spawnShockwave(root, humanoid, scale)
+				if scale >= SHOCKWAVE_MIN_SCALE and not (settings.lowGfx and other ~= player) then
+					local groundY = root.Position.Y - root.Size.Y / 2 - humanoid.HipHeight
+					spawnShockwave(Vector3.new(root.Position.X, groundY, root.Position.Z), scale, 10)
 				end
 				local range = scale * 12
 				local distance = (root.Position - myRoot.Position).Magnitude
 				if distance < range then
 					local closeness = 1 - distance / range
-					local sound = make("Sound", {
-						SoundId = THUD_SOUND,
-						Volume = 0.4 + 0.6 * closeness,
-						PlaybackSpeed = math.clamp(0.6 - scale / 500, 0.25, 0.6),
-						RollOffMinDistance = scale * 2,
-						RollOffMaxDistance = range,
-						Parent = root,
-					})
-					sound:Play()
-					task.delay(3, sound.Destroy, sound)
+					play3D("footstep", root, 0.5 + 0.5 * closeness, math.clamp(0.9 - scale / 400, 0.4, 0.9), scale * 2, range)
 					shake(0.25, 0.35 * closeness)
 				end
 			end
@@ -1028,15 +1121,51 @@ local function showToast(text, color)
 end
 notify.OnClientEvent:Connect(showToast)
 
--- Crush Pit: a giant's foot launched us. No damage, just a bounce.
-bounce.OnClientEvent:Connect(function(velocity)
+-- The server launched us: a giant's foot (Crush Pit), a stomp, or a Wind
+-- Launcher. No damage. With flightTime we hold the arc for that long, because
+-- the character would otherwise brake itself in mid-air.
+bounce.OnClientEvent:Connect(function(velocity, flightTime, kind)
 	local character = player.Character
 	local root = character and character:FindFirstChild("HumanoidRootPart")
 	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-	if root and humanoid then
-		humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
-		root.AssemblyLinearVelocity = velocity
+	if not (root and humanoid) then
+		return
+	end
+	if kind == "launch" then
+		playSound("launch")
+	else
 		shake(0.3, 0.6)
+	end
+	humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+	root.AssemblyLinearVelocity = velocity
+	if flightTime then
+		local start = os.clock()
+		local gravity = workspace.Gravity
+		local connection
+		connection = RunService.Heartbeat:Connect(function()
+			local t = os.clock() - start
+			if t >= flightTime or not root.Parent then
+				connection:Disconnect()
+				return
+			end
+			root.AssemblyLinearVelocity = velocity - Vector3.new(0, gravity * t, 0)
+		end)
+	end
+end)
+
+-- Someone 50x+ stomped: boom + shockwave where it hit, camera shake if we're close.
+stompFx.OnClientEvent:Connect(function(position, scale)
+	spawnShockwave(position, scale, 14, Color3.fromRGB(255, 220, 160))
+	local holder = effectPart({ Size = Vector3.one, Transparency = 1, CFrame = CFrame.new(position) })
+	play3D("stomp", holder, 1, 0.8, scale * 3, scale * 30)
+	task.delay(6, holder.Destroy, holder)
+	local myRoot = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+	if myRoot then
+		local range = scale * 20
+		local distance = (myRoot.Position - position).Magnitude
+		if distance < range then
+			shake(0.6, 1.2 * (1 - distance / range))
+		end
 	end
 end)
 
@@ -1244,12 +1373,331 @@ indexButton.Activated:Connect(function()
 	shopPanel.Visible = false -- only one panel open at a time
 end)
 
--- Keyboard shortcut: R to roll
-UserInputService.InputBegan:Connect(function(input, gameProcessed)
-	if not gameProcessed and input.KeyCode == Enum.KeyCode.R then
-		tryRoll()
+---------------------------------------------------------------------
+-- GIANT CONTROLS: Ground Shaker Stomp (F, 50x+) and Colossal Viewport (V, 10x+)
+---------------------------------------------------------------------
+local function myScale()
+	return player.Character and player.Character:GetScale() or 1
+end
+
+local function tryStomp()
+	if myScale() < STOMP_MIN_SCALE then
+		showToast(("Ground Shaker Stomp unlocks at %dx size"):format(STOMP_MIN_SCALE), Color3.fromRGB(190, 190, 205))
+		return
+	end
+	stomp:FireServer()
+end
+
+-- Panoramic shoulder view: camera high above and behind the giant's shoulder,
+-- looking out and down over the island.
+local viewportOn = false
+local viewportConnection = nil
+local function setViewport(on)
+	viewportOn = on
+	local camera = workspace.CurrentCamera
+	if viewportConnection then
+		viewportConnection:Disconnect()
+		viewportConnection = nil
+	end
+	if not on then
+		camera.CameraType = Enum.CameraType.Custom
+		camera.FieldOfView = 70
+		return
+	end
+	camera.CameraType = Enum.CameraType.Scriptable
+	camera.FieldOfView = 85
+	viewportConnection = RunService.RenderStepped:Connect(function()
+		local character = player.Character
+		local root = character and character:FindFirstChild("HumanoidRootPart")
+		if not root or character:GetScale() < VIEWPORT_MIN_SCALE then
+			setViewport(false)
+			return
+		end
+		local s = character:GetScale()
+		local look = root.CFrame.LookVector * Vector3.new(1, 0, 1)
+		look = look.Magnitude > 0.01 and look.Unit or Vector3.new(0, 0, -1)
+		local eye = root.Position + Vector3.new(0, 4.5 * s, 0) - look * 6 * s + root.CFrame.RightVector * 1.5 * s
+		local focus = root.Position + look * 30 * s - Vector3.new(0, 3 * s, 0)
+		camera.CFrame = camera.CFrame:Lerp(CFrame.lookAt(eye, focus), 0.15)
+	end)
+end
+
+local function toggleViewport()
+	if not viewportOn and myScale() < VIEWPORT_MIN_SCALE then
+		showToast(("Colossal Viewport unlocks at %dx size"):format(VIEWPORT_MIN_SCALE), Color3.fromRGB(190, 190, 205))
+		return
+	end
+	setViewport(not viewportOn)
+end
+
+-- On-screen buttons too (phones have no F / V keys); shown once you're big enough.
+local function sideButton(text, y, color)
+	return make("TextButton", {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -12, 0.5, y),
+		Size = UDim2.new(0, 96, 0, 40),
+		BackgroundColor3 = color,
+		Font = FONT,
+		Text = text,
+		TextColor3 = Color3.new(1, 1, 1),
+		TextSize = 18,
+		Visible = false,
+		Parent = gui,
+	}, { corner(12), stroke(3, Color3.fromRGB(30, 30, 40)) })
+end
+local stompButton = sideButton("STOMP [F]", -120, Color3.fromRGB(200, 90, 50))
+local viewButton = sideButton("VIEW [V]", -72, Color3.fromRGB(70, 110, 190))
+stompButton.Activated:Connect(tryStomp)
+viewButton.Activated:Connect(toggleViewport)
+task.spawn(function()
+	while true do
+		local s = myScale()
+		stompButton.Visible = s >= STOMP_MIN_SCALE
+		viewButton.Visible = s >= VIEWPORT_MIN_SCALE
+		task.wait(0.5)
 	end
 end)
+
+-- Keyboard shortcuts: R to roll, F to stomp, V for the giant viewport
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if gameProcessed then
+		return
+	end
+	if input.KeyCode == Enum.KeyCode.R then
+		tryRoll()
+	elseif input.KeyCode == Enum.KeyCode.F then
+		tryStomp()
+	elseif input.KeyCode == Enum.KeyCode.V then
+		toggleViewport()
+	end
+end)
+
+---------------------------------------------------------------------
+-- AUDIO & SETTINGS: background music, MUTE, and the SETTINGS panel
+-- (Music / SFX / Low GFX), saved with the player's data
+---------------------------------------------------------------------
+local music = make("Sound", { Name = "BackgroundMusic", Volume = MUSIC_VOLUME, Parent = SoundService })
+local trackIndex = 0
+local function nextTrack()
+	trackIndex = trackIndex % #MUSIC + 1
+	music.SoundId = MUSIC[trackIndex]
+	if settings.music then
+		music:Play()
+	end
+end
+music.Ended:Connect(nextTrack)
+
+-- Low GFX: no bloom / sun rays / depth of field / shadows / cloud mist on
+-- this device (other players' auras are handled in TIER EFFECTS).
+local lightingDefaults = {}
+local function applyLowGfx()
+	local lighting = game:GetService("Lighting")
+	for _, effect in ipairs(lighting:GetChildren()) do
+		if effect:IsA("PostEffect") and not effect:IsA("ColorCorrectionEffect") then
+			if lightingDefaults[effect] == nil then
+				lightingDefaults[effect] = effect.Enabled
+			end
+			effect.Enabled = lightingDefaults[effect] and not settings.lowGfx
+		end
+	end
+	if lightingDefaults.shadows == nil then
+		lightingDefaults.shadows = lighting.GlobalShadows
+	end
+	lighting.GlobalShadows = lightingDefaults.shadows and not settings.lowGfx
+	local sky = workspace:FindFirstChild("MapSafety") and workspace.MapSafety:FindFirstChild("SkyRealm")
+	for _, emitter in ipairs(sky and sky:GetDescendants() or {}) do
+		if emitter:IsA("ParticleEmitter") and emitter.Name == "CloudMist" then
+			emitter.Enabled = not settings.lowGfx
+		end
+	end
+end
+
+local muteButton = sideButton("MUTE", 24, Color3.fromRGB(90, 90, 110))
+local settingsButton = sideButton("SETTINGS", -24, Color3.fromRGB(90, 90, 110))
+muteButton.Visible = true
+settingsButton.Visible = true
+
+local settingsPanel = make("Frame", {
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Position = UDim2.fromScale(0.5, 0.45),
+	Size = UDim2.new(0, 320, 0, 250),
+	BackgroundColor3 = Color3.fromRGB(20, 20, 32),
+	BackgroundTransparency = 0.05,
+	Visible = false,
+	ZIndex = 25,
+	Parent = gui,
+}, { corner(16), stroke(3, Color3.fromRGB(70, 70, 110)) })
+make("TextLabel", {
+	Position = UDim2.new(0, 16, 0, 10),
+	Size = UDim2.new(1, -70, 0, 34),
+	BackgroundTransparency = 1,
+	Font = FONT,
+	TextSize = 26,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextColor3 = Color3.new(1, 1, 1),
+	Text = "SETTINGS",
+	Parent = settingsPanel,
+})
+local settingsClose = make("TextButton", {
+	AnchorPoint = Vector2.new(1, 0),
+	Position = UDim2.new(1, -10, 0, 10),
+	Size = UDim2.new(0, 36, 0, 36),
+	BackgroundColor3 = Color3.fromRGB(200, 60, 80),
+	Font = FONT,
+	Text = "X",
+	TextSize = 22,
+	TextColor3 = Color3.new(1, 1, 1),
+	Parent = settingsPanel,
+}, { corner(10) })
+
+local toggleButtons = {} -- [settingKey] = button
+local function refreshSettingsUi()
+	for key, button in pairs(toggleButtons) do
+		button.Text = settings[key] and "ON" or "OFF"
+		button.BackgroundColor3 = settings[key] and Color3.fromRGB(50, 200, 110) or Color3.fromRGB(80, 80, 100)
+	end
+	muteButton.Text = (settings.music or settings.sfx) and "MUTE" or "UNMUTE"
+end
+
+local function applySettings(save)
+	if settings.music and not music.IsPlaying then
+		if music.SoundId == "" then
+			nextTrack()
+		else
+			music:Resume()
+		end
+	elseif not settings.music then
+		music:Pause()
+	end
+	applyLowGfx()
+	refreshSettingsUi()
+	if save then
+		saveSettings:FireServer(settings)
+	end
+end
+
+for row, entry in ipairs({ { "music", "Music" }, { "sfx", "Sound Effects" }, { "lowGfx", "Low GFX Mode" } }) do
+	local key, label = entry[1], entry[2]
+	make("TextLabel", {
+		Position = UDim2.new(0, 20, 0, 54 + (row - 1) * 60),
+		Size = UDim2.new(1, -140, 0, 44),
+		BackgroundTransparency = 1,
+		Font = FONT,
+		TextSize = 22,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextColor3 = Color3.fromRGB(220, 220, 235),
+		Text = label,
+		Parent = settingsPanel,
+	})
+	local button = make("TextButton", {
+		AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.new(1, -20, 0, 58 + (row - 1) * 60),
+		Size = UDim2.new(0, 90, 0, 36),
+		Font = FONT,
+		TextSize = 20,
+		TextColor3 = Color3.new(1, 1, 1),
+		Parent = settingsPanel,
+	}, { corner(10) })
+	button.Activated:Connect(function()
+		settings[key] = not settings[key]
+		applySettings(true)
+	end)
+	toggleButtons[key] = button
+end
+
+settingsButton.Activated:Connect(function()
+	settingsPanel.Visible = not settingsPanel.Visible
+end)
+settingsClose.Activated:Connect(function()
+	settingsPanel.Visible = false
+end)
+muteButton.Activated:Connect(function()
+	local anyOn = settings.music or settings.sfx
+	settings.music = not anyOn
+	settings.sfx = not anyOn
+	applySettings(true)
+end)
+
+-- Load the saved choices once the server sends them (start with defaults until then).
+local function loadSettings()
+	local ok, saved = pcall(HttpService.JSONDecode, HttpService, player:GetAttribute("Settings") or "")
+	if ok and type(saved) == "table" then
+		for key in pairs(settings) do
+			if type(saved[key]) == "boolean" then
+				settings[key] = saved[key]
+			end
+		end
+	end
+	applySettings(false)
+end
+player:GetAttributeChangedSignal("Settings"):Connect(loadSettings)
+loadSettings()
+
+---------------------------------------------------------------------
+-- GROWTH SPINNER ticks: a click each time a slice passes the pointer
+---------------------------------------------------------------------
+task.spawn(function()
+	local lobby = workspace:WaitForChild("Lobby", 30)
+	local spinner = lobby and lobby:WaitForChild("GrowthSpinner", 30)
+	local hub = spinner and spinner:WaitForChild("Hub", 30)
+	local base = spinner and spinner:GetAttribute("BaseCFrame")
+	if not (hub and base) then
+		return
+	end
+	local untilt = CFrame.Angles(0, math.rad(-90), 0)
+	local lastTile = nil
+	RunService.Heartbeat:Connect(function()
+		local _, _, angle = base:ToObjectSpace(hub.CFrame * untilt):ToEulerAnglesXYZ()
+		local tile = math.floor(angle / (2 * math.pi / 100))
+		if lastTile and tile ~= lastTile then
+			play3D("tick", hub, 0.6, 1.3, 10, 150)
+		end
+		lastTile = tile
+	end)
+end)
+
+---------------------------------------------------------------------
+-- SPINNING SKY DECOR (models tagged "SkySpin", attributes SpinAxis + SpinSpeed):
+-- astrolabe rings, crystal rings and the throne crown turn slowly. Each
+-- client turns them locally, so it costs the server nothing.
+---------------------------------------------------------------------
+local CollectionService = game:GetService("CollectionService")
+local skySpinners = {} -- [model] = its original pivot
+local function trackSkySpinner(model)
+	if model:IsA("Model") then
+		skySpinners[model] = model:GetPivot()
+	end
+end
+for _, model in ipairs(CollectionService:GetTagged("SkySpin")) do
+	trackSkySpinner(model)
+end
+CollectionService:GetInstanceAddedSignal("SkySpin"):Connect(trackSkySpinner)
+CollectionService:GetInstanceRemovedSignal("SkySpin"):Connect(function(model)
+	skySpinners[model] = nil
+end)
+RunService.RenderStepped:Connect(function()
+	local t = os.clock()
+	for model, base in pairs(skySpinners) do
+		local axis = model:GetAttribute("SpinAxis") or Vector3.yAxis
+		local speed = model:GetAttribute("SpinSpeed") or 0.2
+		model:PivotTo(base * CFrame.fromAxisAngle(axis, t * speed))
+	end
+end)
+
+---------------------------------------------------------------------
+-- UI click sound on every button
+---------------------------------------------------------------------
+local function hookClick(obj)
+	if obj:IsA("GuiButton") then
+		obj.Activated:Connect(function()
+			playSound("click")
+		end)
+	end
+end
+for _, obj in ipairs(gui:GetDescendants()) do
+	hookClick(obj)
+end
+gui.DescendantAdded:Connect(hookClick)
 
 ---------------------------------------------------------------------
 -- SERVER-WIDE ANNOUNCEMENTS
