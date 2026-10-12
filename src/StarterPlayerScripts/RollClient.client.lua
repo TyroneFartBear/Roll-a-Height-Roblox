@@ -34,6 +34,7 @@ local FONT = Enum.Font.FredokaOne
 local POPUP_HOLD_TIME = 2.5 -- how long the result stays on screen
 local BIG_REVEAL_ONE_IN = 1000 -- flash + strong shake at this rarity or rarer
 local SMALL_REVEAL_ONE_IN = 100 -- light shake at this rarity or rarer
+local AUTO_ROLL_INTERVAL = 1.5 -- seconds between auto-rolls
 
 -- Paste sound IDs from the Creator Store here, e.g. "rbxassetid://12345".
 -- Left empty = no sound (nothing breaks).
@@ -158,6 +159,39 @@ local rollButton = make("TextButton", {
 	}),
 })
 local rollButtonScale = make("UIScale", { Parent = rollButton })
+
+local AUTO_OFF_COLOR = Color3.fromRGB(70, 70, 90)
+local AUTO_ON_COLOR = Color3.fromRGB(50, 200, 110)
+local autoButton = make("TextButton", {
+	LayoutOrder = 3,
+	Size = UDim2.new(0, 110, 0, 52),
+	BackgroundColor3 = AUTO_OFF_COLOR,
+	Font = FONT,
+	Text = "AUTO\nOFF",
+	TextColor3 = Color3.new(1, 1, 1),
+	TextSize = 20,
+	Parent = bottomBar,
+}, { corner(14) })
+local autoStroke = stroke(3, Color3.fromRGB(25, 25, 35))
+autoStroke.Parent = autoButton
+
+-- "Luck: 1.2x  •  Friend Boost +20%" pill above the status line
+local luckLabel = make("TextLabel", {
+	AnchorPoint = Vector2.new(0.5, 1),
+	Position = UDim2.new(0.5, 0, 1, -142),
+	Size = UDim2.new(0, 0, 0, 26),
+	AutomaticSize = Enum.AutomaticSize.X,
+	BackgroundColor3 = Color3.fromRGB(20, 20, 30),
+	BackgroundTransparency = 0.35,
+	Font = FONT,
+	TextSize = 18,
+	TextColor3 = Color3.new(1, 1, 1),
+	Text = "Luck: 1.0x",
+	Parent = gui,
+}, {
+	corner(13),
+	make("UIPadding", { PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 12) }),
+})
 
 -- "You: Tall (6 ft 3 in)  |  Best: Giant" line above the buttons
 local statusLabel = make("TextLabel", {
@@ -316,6 +350,50 @@ refreshStatus()
 applyCamera(false)
 
 ---------------------------------------------------------------------
+-- GIANT ANIMATION FIX
+-- Animations move the root joint a little (idle bob, walk sway). On a
+-- scaled-up character Roblox blows that offset up far too much (it grows
+-- with scale squared): at 35x+ the whole body sinks hundreds of studs
+-- through the floor. For big characters we keep each joint's animated
+-- rotation but drop its animated position. Each client fixes its own
+-- character, which is the one it animates.
+---------------------------------------------------------------------
+local ANIM_FIX_MIN_SCALE = 2
+local myMotors = {}
+
+local function trackMotors(character)
+	myMotors = {}
+	for _, obj in ipairs(character:GetDescendants()) do
+		if obj:IsA("Motor6D") then
+			table.insert(myMotors, obj)
+		end
+	end
+	character.DescendantAdded:Connect(function(obj)
+		if obj:IsA("Motor6D") then
+			table.insert(myMotors, obj)
+		end
+	end)
+end
+
+player.CharacterAdded:Connect(trackMotors)
+if player.Character then
+	trackMotors(player.Character)
+end
+
+RunService.PreSimulation:Connect(function()
+	local character = player.Character
+	if not character or character:GetScale() < ANIM_FIX_MIN_SCALE then
+		return
+	end
+	for _, motor in ipairs(myMotors) do
+		local transform = motor.Transform
+		if transform.Position.Magnitude > 0 then
+			motor.Transform = transform.Rotation
+		end
+	end
+end)
+
+---------------------------------------------------------------------
 -- JUICE: flash + shake
 ---------------------------------------------------------------------
 local function doFlash(color)
@@ -360,6 +438,8 @@ end
 ---------------------------------------------------------------------
 local rolling = false
 local popupToken = 0
+local autoOn = false
+local lastRollFire = 0
 
 local function setRolling(isRolling)
 	rolling = isRolling
@@ -436,6 +516,7 @@ local function tryRoll(forcedTierId)
 		return
 	end
 	setRolling(true)
+	lastRollFire = os.clock()
 	requestToken += 1
 	local myToken = requestToken
 	if forcedTierId then
@@ -456,7 +537,7 @@ rollResult.OnClientEvent:Connect(function(tierId, scale, isNewBest, spinTime)
 	setRolling(true)
 	spin(spinTime)
 	reveal(tierId, scale, isNewBest)
-	task.wait(0.5)
+	task.wait(autoOn and 0.15 or 0.5) -- shorter pause keeps auto-roll on its 1.5s beat
 	setRolling(false)
 end)
 
@@ -475,6 +556,54 @@ equipButton.Activated:Connect(function()
 		equipBest:FireServer()
 	end
 end)
+
+---------------------------------------------------------------------
+-- AUTO-ROLL
+---------------------------------------------------------------------
+local autoToken = 0
+
+local function setAuto(on)
+	autoOn = on
+	autoToken += 1
+	autoButton.Text = on and "AUTO\nON" or "AUTO\nOFF"
+	autoButton.BackgroundColor3 = on and AUTO_ON_COLOR or AUTO_OFF_COLOR
+	autoStroke.Color = on and Color3.fromRGB(15, 80, 40) or Color3.fromRGB(25, 25, 35)
+	if not on then
+		return
+	end
+	local myToken = autoToken
+	task.spawn(function()
+		while autoOn and autoToken == myToken do
+			if not rolling and os.clock() - lastRollFire >= AUTO_ROLL_INTERVAL then
+				tryRoll()
+			end
+			task.wait(0.05)
+		end
+	end)
+end
+
+autoButton.Activated:Connect(function()
+	setAuto(not autoOn)
+end)
+
+---------------------------------------------------------------------
+-- LUCK BADGE
+---------------------------------------------------------------------
+local function refreshLuck()
+	local boost = player:GetAttribute("FriendBoost") or 0
+	local luck = (player:GetAttribute("Luck") or 1) + boost
+	local pct = math.floor(boost * 100 + 0.5)
+	if pct > 0 then
+		luckLabel.Text = ("Luck: %.1fx  •  Friend Boost +%d%%"):format(luck, pct)
+		luckLabel.TextColor3 = Color3.fromRGB(120, 255, 150)
+	else
+		luckLabel.Text = ("Luck: %.1fx"):format(luck)
+		luckLabel.TextColor3 = Color3.new(1, 1, 1)
+	end
+end
+player:GetAttributeChangedSignal("FriendBoost"):Connect(refreshLuck)
+player:GetAttributeChangedSignal("Luck"):Connect(refreshLuck)
+refreshLuck()
 
 -- Keyboard shortcut: R to roll
 UserInputService.InputBegan:Connect(function(input, gameProcessed)

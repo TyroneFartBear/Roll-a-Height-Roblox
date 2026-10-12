@@ -18,12 +18,14 @@ local Tiers = RarityTable.Tiers
 ---------------------------------------------------------------------
 -- SETTINGS (safe to tweak)
 ---------------------------------------------------------------------
-local ROLL_COOLDOWN = 1.6 -- seconds between rolls per player
+local ROLL_COOLDOWN = 1.3 -- seconds between rolls per player (spin is 1.2s, auto-roll fires every 1.5s)
 local SPIN_TIME = 1.2 -- how long the "slot machine" spins before the reveal
 local AUTOSAVE_INTERVAL = 90 -- seconds
 local DATASTORE_NAME = "RollYourHeight_v1" -- change this to wipe everyone's saves
 local BASE_WALKSPEED = 16
 local BASE_JUMP_HEIGHT = 7.2
+local FRIEND_BOOST_PER_FRIEND = 0.10 -- +10% luck per Roblox friend in the same server
+local FRIEND_BOOST_MAX = 0.50 -- capped at +50%
 
 ---------------------------------------------------------------------
 -- REMOTES: the "phone lines" between client and server.
@@ -49,7 +51,13 @@ remotes.Parent = ReplicatedStorage
 ---------------------------------------------------------------------
 -- PLAYER DATA
 ---------------------------------------------------------------------
-local store = DataStoreService:GetDataStore(DATASTORE_NAME)
+local storeOk, store = pcall(function()
+	return DataStoreService:GetDataStore(DATASTORE_NAME)
+end)
+if not storeOk then
+	warn("[RollServer] DataStore unavailable (" .. tostring(store) .. "). Saving is OFF this session.")
+	store = nil
+end
 local rng = Random.new()
 local playerData = {} -- [player] = { currentId, currentScale, bestId, bestScale, rolls, canSave }
 local lastRollTime = {} -- [player] = os.clock() of their last roll
@@ -278,8 +286,49 @@ end
 -- ROLLING
 ---------------------------------------------------------------------
 local function getLuck(player)
-	-- Hook for later: luck potions / VIP gamepass set this attribute.
-	return player:GetAttribute("Luck") or 1
+	-- "Luck" is the hook for luck potions / VIP gamepass; "FriendBoost" comes from friends in the server.
+	return (player:GetAttribute("Luck") or 1) + (player:GetAttribute("FriendBoost") or 0)
+end
+
+---------------------------------------------------------------------
+-- SOCIAL LUCK: +10% per Roblox friend in the same server (max +50%)
+---------------------------------------------------------------------
+local friendCache = {} -- ["lowId:highId"] = true/false, friendship never re-checked per server
+
+local function areFriends(a, b)
+	if a.UserId <= 0 or b.UserId <= 0 then
+		return false -- Studio test players have fake ids
+	end
+	local key = math.min(a.UserId, b.UserId) .. ":" .. math.max(a.UserId, b.UserId)
+	if friendCache[key] == nil then
+		local ok, result = pcall(a.IsFriendsWith, a, b.UserId)
+		if not ok then
+			return false -- web call failed; don't cache so it's retried next time
+		end
+		friendCache[key] = result
+	end
+	return friendCache[key]
+end
+
+local function refreshFriendBoost(player, leaving)
+	local count = 0
+	for _, other in ipairs(Players:GetPlayers()) do
+		if other ~= player and other ~= leaving and areFriends(player, other) then
+			count += 1
+		end
+	end
+	if player.Parent then
+		player:SetAttribute("FriendsInServer", count)
+		player:SetAttribute("FriendBoost", math.min(count * FRIEND_BOOST_PER_FRIEND, FRIEND_BOOST_MAX))
+	end
+end
+
+local function refreshAllFriendBoosts(leaving)
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player ~= leaving then
+			task.spawn(refreshFriendBoost, player, leaving)
+		end
+	end
 end
 
 local function tryStartCooldown(player)
@@ -358,6 +407,9 @@ end)
 ---------------------------------------------------------------------
 local function onPlayerAdded(player)
 	setupLeaderstats(player)
+	player:SetAttribute("FriendBoost", 0)
+	player:SetAttribute("FriendsInServer", 0)
+	refreshAllFriendBoosts() -- everyone re-checks: the newcomer may be someone's friend
 
 	local data = defaultData()
 	local saved, loadedOk = loadData(player)
@@ -393,6 +445,7 @@ for _, player in ipairs(Players:GetPlayers()) do
 end
 
 Players.PlayerRemoving:Connect(function(player)
+	refreshAllFriendBoosts(player)
 	saveData(player)
 	playerData[player] = nil
 	lastRollTime[player] = nil
