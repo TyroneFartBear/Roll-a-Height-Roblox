@@ -22,6 +22,12 @@ local Tiers = RarityTable.Tiers
 ---------------------------------------------------------------------
 -- SETTINGS (safe to tweak)
 ---------------------------------------------------------------------
+-- Gamepass ids (Creator Dashboard > Monetization > Passes)
+local PASS_AUTO_ROLL = 2026443240
+local PASS_FAST_ROLL = 2025621241
+local PASS_2X_LUCK = 2025657204
+local PASS_VIP = 2026899242
+
 local ROLL_COOLDOWN = 1.3 -- seconds between rolls per player (spin is 1.2s, auto-roll fires every 1.5s)
 local SPIN_TIME = 1.2 -- how long the "slot machine" spins before the reveal
 local AUTOSAVE_INTERVAL = 90 -- seconds
@@ -73,11 +79,13 @@ local PIT_PARTICIPATION_ESSENCE = 1 -- everyone in the pit, every 10s while gian
 local LAUNCH_MAX_SCALE = 2.5
 local LAUNCH_COOLDOWN = 3
 
--- Updraft Void Catcher: a non-giant who falls off a cloud gets caught by a
--- soft updraft below this height and set down at the spawn plaza
-local CATCH_Y = 150
+-- Cloud Realm Void Catch: a non-giant who falls off a cloud is stopped below
+-- this height and set down safely on the spawn dais with a soft whoosh
+local CATCH_Y = 180
 local CATCH_MAX_SCALE = 10 -- giants step down from the clouds on purpose
-local CATCH_DROP = 15 -- only after falling this far below the cloud they left
+local CATCH_DROP = 15 -- only after falling this far below the cloud they left (the low steps sit under CATCH_Y)
+local CATCH_SPOT = Vector3.new(0, 10, 0) -- the main spawn dais
+local CATCH_WHOOSH = "rbxassetid://9113840530" -- soft wind whoosh (Pro Sound Effects)
 
 -- Mist barriers (collision group "MistBarrier") ring the cloud edges. They
 -- stop normal-sized players; characters this big walk through them.
@@ -94,6 +102,14 @@ local STOMP_COOLDOWN = 10
 local STOMP_RADIUS = 4 -- x the stomper's scale, in studs
 local STOMP_POP = 45 -- upward launch speed for popped players
 local STOMP_SIZE_RATIO = 0.1 -- only players at most a tenth of the stomper's size get popped
+local STOMP_PROP_RADIUS = 1.8 -- x scale: "DestructibleProp" props this close get launched
+-- (one table: a Luau script can only have 200 locals at the top level)
+local PROP = {
+	ESSENCE = 5, -- Growth Essence per prop launched (stomped or kicked)
+	LAUNCH_SPEED = 90, -- studs/s outward + upward, given as an impulse (mass x speed)
+	KICK_MIN_SCALE = 10, -- giants this big knock props over just by walking into them
+	RESPAWN = 30, -- seconds before a toppled prop is rebuilt
+}
 
 -- Sky Realm (cloud layers, altars and orbs are built in Studio and found by tag)
 local SKY_BLESSING = 0.25 -- +25% luck after touching a Sky Altar, while you stand over a cloud
@@ -101,16 +117,19 @@ local ORB_RESPAWN = 90 -- seconds before a collected Sky Orb comes back
 local ORB_SURGE_TIME = 60
 local ORB_LUCK_MULT = 1.5
 
--- Gamepasses: put your real gamepass ids here (0 = not on sale yet)
+-- Gamepasses (ids are the PASS_ constants at the top; 0 = not on sale yet)
 local GAMEPASSES = {
-	AutoRoll = { id = 0, name = "Auto Roll" },
-	Luck2x = { id = 0, name = "2x Luck" },
-	FastRoll = { id = 0, name = "Fast Roll" },
-	VIP = { id = 0, name = "VIP Rank" },
+	AutoRoll = { id = PASS_AUTO_ROLL, name = "Auto Roll" },
+	Luck2x = { id = PASS_2X_LUCK, name = "2x Luck" },
+	FastRoll = { id = PASS_FAST_ROLL, name = "Fast Roll" },
+	VIP = { id = PASS_VIP, name = "VIP Rank" },
 }
 local DEBUG_UNLOCK_PASSES = true -- Studio playtests only: every pass starts unlocked. Never applies in the live game.
 local VIP_BOOST = 0.25
-local FAST_ROLL_COOLDOWN = 0.7 -- Fast Roll: a roll every ~0.75s (normal: 1.3s)
+local FAST_ROLL_COOLDOWN = ROLL_COOLDOWN / 2 -- Fast Roll halves the cooldown (0.65s)
+
+-- Rolls this rare (1 in N) or rarer are announced to the whole server and in chat
+local ANNOUNCE_ONE_IN = 100
 local FAST_SPIN_TIME = 0.55 -- still a full (short) spin, nothing skipped
 
 ---------------------------------------------------------------------
@@ -693,7 +712,7 @@ local function updateVipTag(player)
 	label.BackgroundTransparency = 1
 	label.Font = Enum.Font.FredokaOne
 	label.TextScaled = true
-	label.Text = "VIP"
+	label.Text = "[VIP]"
 	label.TextColor3 = Color3.fromRGB(255, 215, 0)
 	local outline = Instance.new("UIStroke")
 	outline.Thickness = 2
@@ -986,7 +1005,7 @@ local function doRoll(player, forcedTierId, opts)
 		applyHeight(player)
 		refreshStats(player)
 		refreshLuckInfo(player)
-		if tier.announce then
+		if tier.announce or RarityTable.Rarity(tierId) >= ANNOUNCE_ONE_IN then
 			announce:FireAllClients(player.DisplayName, tierId, scale)
 		end
 	end)
@@ -1228,96 +1247,83 @@ end
 CollectionService:GetInstanceAddedSignal("WindLauncher"):Connect(connectLauncher)
 
 ---------------------------------------------------------------------
--- UPDRAFT VOID CATCHER: a normal-sized player who falls off a cloud is
--- caught by a soft updraft once they drop below CATCH_Y, then set down at
--- the spawn plaza instead of free-falling all the way to the grass
+-- CLOUD REALM VOID CATCH: a normal-sized player who falls off a cloud is
+-- stopped dead once they drop below CATCH_Y and set down on the spawn dais
+-- with a soft whoosh, instead of free-falling all the way to the grass
 ---------------------------------------------------------------------
--- What's under the feet? (The server can't trust Humanoid.FloorMaterial: each
--- client simulates its own character, so we look with a ray instead.)
-local floorRay = RaycastParams.new()
-floorRay.FilterType = Enum.RaycastFilterType.Exclude
-floorRay.RespectCanCollide = true -- see-through cloud puffs don't count as floor
+do -- (scoped: Luau allows 200 top-level locals)
+	-- What's under the feet? (The server can't trust Humanoid.FloorMaterial: each
+	-- client simulates its own character, so we look with a ray instead.)
+	local floorRay = RaycastParams.new()
+	floorRay.FilterType = Enum.RaycastFilterType.Exclude
+	floorRay.RespectCanCollide = true -- see-through cloud puffs don't count as floor
 
-local function plazaPoint()
-	local spawn = workspace:FindFirstChildOfClass("SpawnLocation")
-	return spawn and spawn.Position + Vector3.new(0, spawn.Size.Y / 2, 0) or Vector3.zero
-end
+	local function catchFall(player, fx, character, root, humanoid)
+		fx.catching = true
+		-- clear the cloud state: no longer "on a cloud", and the Sky Blessing ends here
+		fx.cloudFeetY = nil
+		if fx.sky then
+			fx.sky = false
+			refreshLuckInfo(player)
+		end
+		-- the server takes over the character's physics for the move, so the
+		-- client can't carry its old fall speed into the new spot
+		pcall(root.SetNetworkOwner, root, nil)
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
+		local feetOffset = root.Size.Y / 2 + humanoid.HipHeight
+		character:PivotTo(CFrame.new(CATCH_SPOT + Vector3.new(0, feetOffset, 0)))
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
 
-local function catchFall(player, fx, character, root, humanoid)
-	fx.catching = true
-	fx.cloudFeetY = nil
-	-- the server takes over the character's physics for the catch, so the
-	-- updraft grabs it right away instead of a network round trip later
-	pcall(root.SetNetworkOwner, root, nil)
-	local fallSpeed = root.AssemblyLinearVelocity.Y * 0.5 -- halve the fall at once, then ease into the float
-	local lift = Instance.new("BodyVelocity") -- eases the fall into a gentle upward float
-	lift.Name = "UpdraftCatch"
-	lift.MaxForce = Vector3.one * 1e7
-	lift.Velocity = Vector3.new(0, fallSpeed, 0)
-	lift.Parent = root
+		local whoosh = Instance.new("Sound")
+		whoosh.Name = "CatchWhoosh"
+		whoosh.SoundId = CATCH_WHOOSH
+		whoosh.Volume = 0.45
+		whoosh.RollOffMaxDistance = 150
+		whoosh.Parent = root
+		whoosh:Play()
+		task.delay(4, whoosh.Destroy, whoosh)
+		tell(player, "A gust of wind carried you back to spawn!", SKY_BLUE)
+
+		task.delay(0.25, function()
+			if character.Parent and root.Parent then
+				root.AssemblyLinearVelocity = Vector3.zero
+				pcall(root.SetNetworkOwner, root, player)
+			end
+			fx.catching = false
+		end)
+	end
+
 	task.spawn(function()
-		for step = 1, 5 do
-			task.wait(0.04)
-			lift.Velocity = Vector3.new(0, fallSpeed + (8 - fallSpeed) * step / 5, 0)
-		end
-	end)
-	local wind = Instance.new("ParticleEmitter")
-	wind.Name = "UpdraftCatch"
-	wind.Texture = SPARKLE_TEXTURE
-	wind.Color = ColorSequence.new(Color3.fromRGB(200, 235, 255))
-	wind.LightEmission = 0.6
-	wind.Orientation = Enum.ParticleOrientation.VelocityParallel
-	wind.Squash = NumberSequence.new(2)
-	wind.Transparency = NumberSequence.new(0.2, 1)
-	wind.Size = NumberSequence.new(1.2, 0)
-	wind.Lifetime = NumberRange.new(0.6, 1)
-	wind.Rate = 60
-	wind.Speed = NumberRange.new(25, 40)
-	wind.EmissionDirection = Enum.NormalId.Top
-	wind.SpreadAngle = Vector2.new(25, 25)
-	wind.Parent = root
-	tell(player, "An updraft caught you!  Floating back to the plaza...", SKY_BLUE)
-	task.delay(1.6, function()
-		lift:Destroy()
-		wind:Destroy()
-		if character.Parent and humanoid.Health > 0 then
-			local feetOffset = root.Size.Y / 2 + humanoid.HipHeight
-			root.AssemblyLinearVelocity = Vector3.zero
-			character:PivotTo(CFrame.new(plazaPoint() + Vector3.new(0, feetOffset + 0.5, 0)))
-			pcall(root.SetNetworkOwner, root, player)
-		end
-		fx.catching = false
-	end)
-end
-
-task.spawn(function()
-	while true do
-		task.wait(0.1)
-		local characters = {}
-		for _, player in ipairs(Players:GetPlayers()) do
-			table.insert(characters, player.Character)
-		end
-		floorRay.FilterDescendantsInstances = characters
-		for player, fx in pairs(effects) do
-			local character = player.Character
-			local root = character and character:FindFirstChild("HumanoidRootPart")
-			local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-			if root and humanoid and humanoid.Health > 0 and skyRealm and not fx.catching then
-				local feetOffset = root.Size.Y / 2 + humanoid.HipHeight
-				local feetY = root.Position.Y - feetOffset
-				local floor = workspace:Raycast(root.Position, Vector3.new(0, -(feetOffset + 4), 0), floorRay)
-				if character:GetScale() >= CATCH_MAX_SCALE then
-					fx.cloudFeetY = nil
-				elseif floor then
-					-- standing: on a cloud (remember how high) or on the ground (forget)
-					fx.cloudFeetY = floor.Instance:IsDescendantOf(skyRealm) and feetY or nil
-				elseif fx.cloudFeetY and feetY < math.min(CATCH_Y, fx.cloudFeetY - CATCH_DROP) and root.AssemblyLinearVelocity.Y < 0 then
-					catchFall(player, fx, character, root, humanoid)
+		while true do
+			task.wait(0.1)
+			local characters = {}
+			for _, player in ipairs(Players:GetPlayers()) do
+				table.insert(characters, player.Character)
+			end
+			floorRay.FilterDescendantsInstances = characters
+			for player, fx in pairs(effects) do
+				local character = player.Character
+				local root = character and character:FindFirstChild("HumanoidRootPart")
+				local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+				if root and humanoid and humanoid.Health > 0 and skyRealm and not fx.catching then
+					local feetOffset = root.Size.Y / 2 + humanoid.HipHeight
+					local feetY = root.Position.Y - feetOffset
+					local floor = workspace:Raycast(root.Position, Vector3.new(0, -(feetOffset + 4), 0), floorRay)
+					if character:GetScale() >= CATCH_MAX_SCALE then
+						fx.cloudFeetY = nil
+					elseif floor then
+						-- standing: on a cloud (remember how high) or on the ground (forget)
+						fx.cloudFeetY = floor.Instance:IsDescendantOf(skyRealm) and feetY or nil
+					elseif fx.cloudFeetY and feetY < math.min(CATCH_Y, fx.cloudFeetY - CATCH_DROP) and root.AssemblyLinearVelocity.Y < 0 then
+						catchFall(player, fx, character, root, humanoid)
+					end
 				end
 			end
 		end
-	end
-end)
+	end)
+end
 
 -- Twice a second: update the throne, end Sky Blessings for anyone who left
 -- the clouds, and refresh everyone's luck badge (timers count down).
@@ -1477,8 +1483,135 @@ if wheelPrompt then
 end
 
 ---------------------------------------------------------------------
+-- DESTRUCTIBLE PROPS (tag "DestructibleProp"): the Micro-Toy Metropolis in
+-- Workspace.EnvironmentZones. A tagged Model (a building) or BasePart (a car,
+-- a lamp) counts as one prop. Stomps launch every prop nearby; giants 10x+
+-- also knock props over by walking into them. +5 Essence per prop, and each
+-- prop rebuilds itself PROP.RESPAWN seconds later.
+---------------------------------------------------------------------
+local function giveEssence(player, amount)
+	local data = playerData[player]
+	if data and amount > 0 then
+		data.essence += amount
+		player:SetAttribute("Essence", data.essence)
+	end
+end
+
+local launchPropsNear -- set in the block below (kept in a do block: Luau allows 200 top-level locals)
+do
+	local props = {} -- [prop] = { center = Vector3, home = { [part] = CFrame }, down = bool }
+
+	local function launchProp(prop, from, speed)
+		local info = props[prop]
+		if not info or info.down then
+			return false
+		end
+		info.down = true
+		local outward = (info.center - from) * Vector3.new(1, 0, 1)
+		local dir = outward.Magnitude > 0.01 and outward.Unit or Vector3.new(rng:NextNumber(-1, 1), 0, rng:NextNumber(-1, 1)).Unit
+		for part in pairs(info.home) do
+			part.Anchored = false
+		end
+		for part in pairs(info.home) do
+			if part.Parent then
+				pcall(part.SetNetworkOwner, part, nil) -- the server throws it, everyone sees the same arc
+				local velocity = dir * speed * rng:NextNumber(0.7, 1.2) + Vector3.new(0, speed * rng:NextNumber(0.8, 1.3), 0)
+				part:ApplyImpulse(velocity * part.AssemblyMass) -- impulse grows with the prop's mass
+				part:ApplyAngularImpulse(Vector3.new(rng:NextNumber(-1, 1), rng:NextNumber(-1, 1), rng:NextNumber(-1, 1)) * part.AssemblyMass * 4)
+			end
+		end
+		task.delay(PROP.RESPAWN, function()
+			for part, homeCFrame in pairs(info.home) do
+				if part.Parent then
+					part.Anchored = true
+					part.AssemblyLinearVelocity = Vector3.zero
+					part.AssemblyAngularVelocity = Vector3.zero
+					part.CFrame = homeCFrame
+				end
+			end
+			info.down = false
+		end)
+		return true
+	end
+
+	-- Launches every standing prop within radius of from; returns how many.
+	launchPropsNear = function(player, from, radius)
+		local count = 0
+		for prop, info in pairs(props) do
+			if not info.down and ((info.center - from) * Vector3.new(1, 0, 1)).Magnitude <= radius and math.abs(info.center.Y - from.Y) <= radius then
+				if launchProp(prop, from, PROP.LAUNCH_SPEED) then
+					count += 1
+				end
+			end
+		end
+		giveEssence(player, count * PROP.ESSENCE)
+		return count
+	end
+
+	-- Kicks are added up and reported in one toast, so a giant wading through
+	-- the city gets "SMASH! 6 props  +30 Essence" instead of six toasts.
+	local kickTally = {} -- [player] = props kicked since the last toast
+
+	local function onPropTouched(prop, hit)
+		local info = props[prop]
+		local player = info and not info.down and playerFromHit(hit)
+		local character = player and player.Character
+		local root = character and character:FindFirstChild("HumanoidRootPart")
+		if not root or character:GetScale() < PROP.KICK_MIN_SCALE then
+			return
+		end
+		if launchProp(prop, root.Position, PROP.LAUNCH_SPEED * 0.7) then
+			giveEssence(player, PROP.ESSENCE)
+			if not kickTally[player] then
+				kickTally[player] = 0
+				task.delay(1, function()
+					local n = kickTally[player]
+					kickTally[player] = nil
+					if n and player.Parent then
+						tell(player, ("SMASH! %d prop%s  +%d Essence"):format(n, n == 1 and "" or "s", n * PROP.ESSENCE), GOLD)
+					end
+				end)
+			end
+			kickTally[player] += 1
+		end
+	end
+
+	local function connectProp(prop)
+		if props[prop] or not prop:IsDescendantOf(workspace) then
+			return
+		end
+		local parts = prop:IsA("BasePart") and { prop } or {}
+		for _, obj in ipairs(prop:GetDescendants()) do
+			if obj:IsA("BasePart") then
+				table.insert(parts, obj)
+			end
+		end
+		if #parts == 0 then
+			return
+		end
+		local info = { home = {}, down = false }
+		info.center = prop:IsA("BasePart") and prop.Position or (prop:GetBoundingBox()).Position
+		for _, part in ipairs(parts) do
+			info.home[part] = part.CFrame
+			part.Touched:Connect(function(hit)
+				onPropTouched(prop, hit)
+			end)
+		end
+		props[prop] = info
+	end
+	for _, prop in ipairs(CollectionService:GetTagged("DestructibleProp")) do
+		connectProp(prop)
+	end
+	CollectionService:GetInstanceAddedSignal("DestructibleProp"):Connect(connectProp)
+	CollectionService:GetInstanceRemovedSignal("DestructibleProp"):Connect(function(prop)
+		props[prop] = nil
+	end)
+end
+
+---------------------------------------------------------------------
 -- GROUND SHAKER STOMP (F key, 50x+): boom + shockwave for everyone, and
--- players a tenth of the stomper's size (or smaller) nearby get popped up
+-- players a tenth of the stomper's size (or smaller) nearby get popped up,
+-- and DestructibleProps within scale x STOMP_PROP_RADIUS are launched
 ---------------------------------------------------------------------
 stomp.OnServerEvent:Connect(function(player)
 	local fx = effects[player]
@@ -1512,8 +1645,16 @@ stomp.OnServerEvent:Connect(function(player)
 			end
 		end
 	end
+	local smashed = launchPropsNear(player, ground, scale * STOMP_PROP_RADIUS)
+	local results = {}
 	if popped > 0 then
-		tell(player, ("STOMP! You popped %d player%s"):format(popped, popped == 1 and "" or "s"), GOLD)
+		table.insert(results, ("popped %d player%s"):format(popped, popped == 1 and "" or "s"))
+	end
+	if smashed > 0 then
+		table.insert(results, ("smashed %d prop%s  +%d Essence"):format(smashed, smashed == 1 and "" or "s", smashed * PROP.ESSENCE))
+	end
+	if #results > 0 then
+		tell(player, "STOMP! You " .. table.concat(results, ", "), GOLD)
 	end
 end)
 
@@ -1542,14 +1683,6 @@ local pitCenter = pitModel and pitModel:GetAttribute("Center")
 local pitRadius = pitModel and pitModel:GetAttribute("Radius")
 local pitScores = {} -- [player] = bounces given + taken this server
 local lastBounced = {} -- [player] = os.clock() of their last bounce
-
-local function giveEssence(player, amount)
-	local data = playerData[player]
-	if data and amount > 0 then
-		data.essence += amount
-		player:SetAttribute("Essence", data.essence)
-	end
-end
 
 local function updatePitBoard()
 	local display = pitModel and pitModel:FindFirstChild("Display", true)

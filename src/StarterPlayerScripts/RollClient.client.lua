@@ -43,7 +43,7 @@ local player = Players.LocalPlayer
 local FONT = Enum.Font.FredokaOne
 local POPUP_HOLD_TIME = 2.5 -- how long the result stays on screen
 local BIG_REVEAL_ONE_IN = 1000 -- the rare chime at this rarity or rarer
-local FLASH_REVEAL_ONE_IN = 100 -- rarer than this: a crisp 0.3s camera-shake pulse + screen flash
+local FLASH_REVEAL_ONE_IN = 100 -- this rare or rarer: 0.35s camera shake, color flash and a low impact
 local AUTO_ROLL_INTERVAL = 1.5 -- seconds between auto-rolls
 local FAST_AUTO_ROLL_INTERVAL = 0.75 -- with the Fast Roll pass
 local GLYPH_MIN_SCALE = 50 -- characters this big get a spinning glyph on the ground under them
@@ -51,8 +51,13 @@ local FOOTSTEP_MIN_SCALE = 10 -- characters this big (or bigger) shake the groun
 local SHOCKWAVE_MIN_SCALE = 150 -- god tiers send a shockwave ring out on every footstep
 local STOMP_MIN_SCALE = 50 -- F key / STOMP button
 local VIEWPORT_MIN_SCALE = 10 -- V key / VIEW button
-local MIN_CAMERA_ZOOM = 30 -- max zoom at 1x
-local MAX_CAMERA_ZOOM = 2500
+local CAMERA_ZOOM_PER_SCALE = 35 -- max zoom = scale x 35, kept between the two limits below
+local CAMERA_MAX_ZOOM_LOW = 128
+local CAMERA_MAX_ZOOM_HIGH = 5000
+local CAMERA_MIN_ZOOM = 0.5
+local CAMERA_PUSH_MIN_SCALE = 5 -- past this size the camera is kept outside the body...
+local BODY_CLEARANCE = 4.2 -- ...this many studs per 1x of scale (a 1x body's bounding box, from the head)
+local CAMERA_GLIDE_TIME = 0.6
 local HIGH_TIER_MIN_SCALE = 35 -- Colossus and up get the cinematic reveal sound
 
 -- Sound effects: Roblox UI sounds and Roblox-licensed Pro Sound Effects /
@@ -210,15 +215,6 @@ local gui = make("ScreenGui", {
 	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
 })
 
--- Full-screen flash for rare rolls
-local flash = make("Frame", {
-	Size = UDim2.fromScale(1, 1),
-	BackgroundColor3 = Color3.new(1, 1, 1),
-	BackgroundTransparency = 1,
-	ZIndex = 50,
-	Parent = gui,
-})
-
 -- Bottom bar: [EQUIP BEST] [ROLL]
 local bottomBar = make("Frame", {
 	AnchorPoint = Vector2.new(0.5, 1),
@@ -281,23 +277,77 @@ local autoButton = make("TextButton", {
 local autoStroke = stroke(3, Color3.fromRGB(25, 25, 35))
 autoStroke.Parent = autoButton
 
--- "Luck: 1.2x  •  Friend Boost +20%" pill above the status line
-local luckLabel = make("TextLabel", {
+-- Compact "🍀 1.2x LUCK (i)" pill above the status line. The breakdown of
+-- active boosts shows in a tooltip on hover, or on click / tap (pins it open).
+local luckPill = make("TextButton", {
+	Name = "LuckPill",
 	AnchorPoint = Vector2.new(0.5, 1),
 	Position = UDim2.new(0.5, 0, 1, -142),
-	Size = UDim2.new(0, 0, 0, 26),
-	AutomaticSize = Enum.AutomaticSize.XY, -- grows upward when active boosts add a second line
+	Size = UDim2.new(0, 0, 0, 28),
+	AutomaticSize = Enum.AutomaticSize.X,
 	BackgroundColor3 = Color3.fromRGB(20, 20, 30),
 	BackgroundTransparency = 0.35,
-	Font = FONT,
-	RichText = true,
-	TextSize = 18,
-	TextColor3 = Color3.new(1, 1, 1),
-	Text = "Luck: 1.0x",
+	AutoButtonColor = false,
+	Text = "",
 	Parent = gui,
 }, {
-	corner(13),
-	make("UIPadding", { PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 12) }),
+	corner(14),
+	make("UIPadding", { PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 6) }),
+	make("UIListLayout", {
+		FillDirection = Enum.FillDirection.Horizontal,
+		VerticalAlignment = Enum.VerticalAlignment.Center,
+		Padding = UDim.new(0, 8),
+		SortOrder = Enum.SortOrder.LayoutOrder,
+	}),
+})
+local luckLabel = make("TextLabel", {
+	LayoutOrder = 1,
+	Size = UDim2.new(0, 0, 1, 0),
+	AutomaticSize = Enum.AutomaticSize.X,
+	BackgroundTransparency = 1,
+	Font = FONT,
+	TextSize = 18,
+	TextColor3 = Color3.new(1, 1, 1),
+	Text = "🍀 1x LUCK",
+	Parent = luckPill,
+})
+make("TextLabel", { -- the info icon
+	LayoutOrder = 2,
+	Size = UDim2.fromOffset(18, 18),
+	BackgroundColor3 = Color3.new(1, 1, 1),
+	BackgroundTransparency = 0.8,
+	Font = Enum.Font.GothamBold,
+	TextSize = 12,
+	TextColor3 = Color3.new(1, 1, 1),
+	Text = "i",
+	Parent = luckPill,
+}, { corner(9) })
+local luckTooltip = make("TextLabel", {
+	Name = "LuckTooltip",
+	AnchorPoint = Vector2.new(0.5, 1),
+	Position = UDim2.new(0.5, 0, 1, -176),
+	Size = UDim2.fromOffset(0, 0),
+	AutomaticSize = Enum.AutomaticSize.XY,
+	BackgroundColor3 = Color3.fromRGB(20, 20, 30),
+	BackgroundTransparency = 0.15,
+	Font = FONT,
+	RichText = true,
+	TextSize = 15,
+	LineHeight = 1.15,
+	TextColor3 = Color3.new(1, 1, 1),
+	TextXAlignment = Enum.TextXAlignment.Left,
+	Visible = false,
+	ZIndex = 5,
+	Parent = gui,
+}, {
+	corner(10),
+	stroke(1.5, Color3.fromRGB(120, 255, 150)),
+	make("UIPadding", {
+		PaddingLeft = UDim.new(0, 12),
+		PaddingRight = UDim.new(0, 12),
+		PaddingTop = UDim.new(0, 8),
+		PaddingBottom = UDim.new(0, 8),
+	}),
 })
 
 -- "You: Tall (6 ft 3 in)  |  Best: Giant" line above the buttons
@@ -426,14 +476,18 @@ end
 -- CAMERA: zoom out for giants, zoom in for tiny players
 ---------------------------------------------------------------------
 local function zoomFor(scale)
-	return math.clamp(12.5 * scale, 0.6, 2500)
+	return math.clamp(12.5 * scale, 0.6, CAMERA_MAX_ZOOM_HIGH)
 end
 
--- Max zoom grows with size (30 at 1x, ~1600 at World Eater) and giants
--- can't zoom in so close that the camera ends up inside their own head or torso.
+-- Max zoom grows with size (128 up to 3.6x, 7000 -> capped 5000 at World Eater).
+-- Min zoom is 0.5 (first person), but past 5x the camera is pushed back
+-- outside the avatar's bounding box, so it never ends up in a giant's head or torso.
 local function cameraLimits(scale)
-	local maxZoom = math.clamp(MIN_CAMERA_ZOOM * scale ^ 0.75, MIN_CAMERA_ZOOM, MAX_CAMERA_ZOOM)
-	local minZoom = scale >= 2 and 2.5 * scale or 0.5 -- normal-sized players keep first person
+	local maxZoom = math.clamp(scale * CAMERA_ZOOM_PER_SCALE, CAMERA_MAX_ZOOM_LOW, CAMERA_MAX_ZOOM_HIGH)
+	local minZoom = CAMERA_MIN_ZOOM
+	if scale > CAMERA_PUSH_MIN_SCALE then
+		minZoom = BODY_CLEARANCE * scale
+	end
 	return math.min(minZoom, maxZoom), maxZoom
 end
 
@@ -448,24 +502,57 @@ local function giantCameraOffset(scale)
 	return Vector3.new(0, 0.8 * scale, 1 * scale)
 end
 
+-- The camera glides to its new zoom: min and max zoom are pinned together
+-- and tweened from where the camera is now to the target, then released.
+-- snap = also zoom to fit the new size; otherwise it only moves if the
+-- current zoom is outside the new limits (e.g. pushed out of a giant's body).
+local zoomGlide = nil
 local function applyCamera(snap)
 	local scale = player:GetAttribute("HeightScale") or 1
 	local minZoom, maxZoom = cameraLimits(scale)
-	player.CameraMaxZoomDistance = maxZoom
-	player.CameraMinZoomDistance = minZoom
 	cameraBaseOffset = giantCameraOffset(scale)
 	local humanoid = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
 	if humanoid then
 		humanoid.CameraOffset = cameraBaseOffset
 	end
-	if snap then
-		-- Trick: pin min and max to the same value for a moment to force the zoom.
-		local target = math.clamp(zoomFor(scale), minZoom, maxZoom)
-		player.CameraMinZoomDistance = target
-		player.CameraMaxZoomDistance = target
-		task.wait(0.05)
-		player.CameraMinZoomDistance = minZoom
+	if zoomGlide then
+		zoomGlide:Cancel()
+		zoomGlide = nil
+	end
+	local camera = workspace.CurrentCamera
+	local current = (camera.CFrame.Position - camera.Focus.Position).Magnitude
+	local target = math.clamp(snap and zoomFor(scale) or current, minZoom, maxZoom)
+	if math.abs(target - current) < 0.5 then
 		player.CameraMaxZoomDistance = maxZoom
+		player.CameraMinZoomDistance = minZoom
+		return
+	end
+	local pin = Instance.new("NumberValue")
+	pin.Value = current
+	pin.Changed:Connect(function(zoom)
+		player.CameraMaxZoomDistance = zoom
+		player.CameraMinZoomDistance = zoom
+	end)
+	local glide = TweenService:Create(pin, TweenInfo.new(CAMERA_GLIDE_TIME, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { Value = target })
+	glide.Completed:Connect(function(state)
+		pin:Destroy()
+		if state == Enum.PlaybackState.Completed then
+			zoomGlide = nil
+			player.CameraMaxZoomDistance = maxZoom
+			player.CameraMinZoomDistance = minZoom
+		end
+	end)
+	zoomGlide = glide
+	glide:Play()
+end
+
+-- No tripping, no ragdolls: big falls and launches never knock the
+-- character over (Roblox has no fall damage, so landings are always safe).
+local function setupHumanoid(character)
+	local humanoid = character:WaitForChild("Humanoid", 10)
+	if humanoid then
+		humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+		humanoid:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
 	end
 end
 
@@ -474,9 +561,13 @@ player:GetAttributeChangedSignal("HeightScale"):Connect(function()
 	applyCamera(true)
 end)
 player:GetAttributeChangedSignal("BestTier"):Connect(refreshStatus)
-player.CharacterAdded:Connect(function()
+player.CharacterAdded:Connect(function(character)
+	setupHumanoid(character)
 	task.delay(1.5, applyCamera, true) -- after the server re-sizes the new body
 end)
+if player.Character then
+	task.spawn(setupHumanoid, player.Character)
+end
 refreshStatus()
 applyCamera(false)
 
@@ -529,12 +620,34 @@ end)
 ---------------------------------------------------------------------
 -- JUICE: flash + shake
 ---------------------------------------------------------------------
-local function doFlash(color)
-	flash.BackgroundColor3 = color
-	flash.BackgroundTransparency = 0.2
-	tween(flash, 0.3, { BackgroundTransparency = 1 })
+-- Rare-roll screen flash: a ColorCorrection tint in the tier's color that
+-- fades out (a local effect: only this player's screen).
+local flashCorrection = make("ColorCorrectionEffect", {
+	Name = "RollFlash",
+	Enabled = false,
+	Parent = game:GetService("Lighting"),
+})
+local flashTween = nil
+
+local function doFlash(color, duration)
+	duration = duration or 0.35
+	if flashTween then
+		flashTween:Cancel()
+	end
+	flashCorrection.TintColor = Color3.new(1, 1, 1):Lerp(color, 0.65)
+	flashCorrection.Brightness = 0.3
+	flashCorrection.Saturation = 0.25
+	flashCorrection.Enabled = true
+	flashTween = tween(flashCorrection, duration, { TintColor = Color3.new(1, 1, 1), Brightness = 0, Saturation = 0 })
+	flashTween.Completed:Connect(function(state)
+		if state == Enum.PlaybackState.Completed then
+			flashCorrection.Enabled = false
+		end
+	end)
 end
 
+-- Camera shake: smooth Perlin-noise wobble (not random jitter) that fades out.
+local shakeSeed = 0
 local function shake(duration, strength)
 	local character = player.Character
 	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
@@ -543,6 +656,8 @@ local function shake(duration, strength)
 	end
 	-- Scale the shake to how far the camera is, so giants feel it too.
 	local amount = strength * zoomFor(player:GetAttribute("HeightScale") or 1) / 12.5
+	shakeSeed += 10
+	local seed = shakeSeed
 	local start = os.clock()
 	local connection
 	connection = RunService.RenderStepped:Connect(function()
@@ -552,12 +667,13 @@ local function shake(duration, strength)
 			connection:Disconnect()
 			return
 		end
-		local fade = 1 - t / duration
+		local fade = (1 - t / duration) ^ 2
+		local n = t * 18 -- noise frequency
 		humanoid.CameraOffset = cameraBaseOffset + Vector3.new(
-			(math.random() - 0.5) * amount * fade,
-			(math.random() - 0.5) * amount * fade,
-			(math.random() - 0.5) * amount * fade
-		)
+			math.noise(n, seed, 0.5),
+			math.noise(seed, n, 1.5),
+			math.noise(seed + 3, 2.5, n) * 0.5
+		) * amount * fade
 	end)
 end
 
@@ -885,18 +1001,24 @@ local function reveal(tierId, scale, isNewBest, essence)
 	newBestLabel:FindFirstChildOfClass("UIStroke").Transparency = showNewBest and 0 or 1
 
 	pop(0.3, 0.4)
-	if rarity > FLASH_REVEAL_ONE_IN then
-		-- crisp 0.3s pulse; harder for rarer tiers
-		doFlash(tier.color)
-		shake(0.3, tier.scale >= HIGH_TIER_MIN_SCALE and 1.6 or rarity >= BIG_REVEAL_ONE_IN and 1.2 or 0.8)
+	local hype = rarity >= FLASH_REVEAL_ONE_IN
+	if hype then
+		-- 0.35s cinematic pulse in the tier's color; harder for rarer tiers
+		doFlash(tier.color, 0.35)
+		shake(0.35, tier.scale >= HIGH_TIER_MIN_SCALE and 1.6 or rarity >= BIG_REVEAL_ONE_IN and 1.2 or 0.8)
 	end
 	if tier.scale >= HIGH_TIER_MIN_SCALE then
 		playSound("drop", 1, 0.85)
 		playSound("riser", 0.7)
-	elseif rarity >= BIG_REVEAL_ONE_IN then
-		playSound("rare", 0.6)
 	else
-		playSound("reveal", rarity > FLASH_REVEAL_ONE_IN and 0.6 or 0.45)
+		if hype then
+			playSound("drop", 0.6, 0.7) -- low-frequency impact under the chime
+		end
+		if rarity >= BIG_REVEAL_ONE_IN then
+			playSound("rare", 0.6)
+		else
+			playSound("reveal", hype and 0.6 or 0.45)
+		end
 	end
 
 	local myToken = popupToken
@@ -1022,16 +1144,37 @@ local function refreshLuck()
 	if not ok or type(info) ~= "table" then
 		info = { total = 1, parts = {} }
 	end
-	local text = "Luck: " .. formatLuck(info.total or 1)
 	local active = type(info.parts) == "table" and #info.parts > 0
-	if active then
-		text ..= '\n<font size="14">' .. table.concat(info.parts, "  •  ") .. "</font>"
-	end
-	luckLabel.Text = text
+	luckLabel.Text = "🍀 " .. formatLuck(info.total or 1) .. " LUCK"
 	luckLabel.TextColor3 = active and Color3.fromRGB(120, 255, 150) or Color3.new(1, 1, 1)
+	local lines = { "<b>Luck " .. formatLuck(info.total or 1) .. "</b>" }
+	if active then
+		for _, part in ipairs(info.parts) do
+			table.insert(lines, "•  " .. escapeRichText(tostring(part)))
+		end
+	else
+		table.insert(lines, '<font color="#AAAAB4">No boosts active</font>')
+	end
+	luckTooltip.Text = table.concat(lines, "\n")
 end
 player:GetAttributeChangedSignal("LuckInfo"):Connect(refreshLuck)
 refreshLuck()
+
+-- Tooltip: shows while hovering, a click / tap pins it open (click again to close).
+local tooltipPinned = false
+local function refreshTooltip(hovering)
+	luckTooltip.Visible = tooltipPinned or hovering
+end
+luckPill.MouseEnter:Connect(function()
+	refreshTooltip(true)
+end)
+luckPill.MouseLeave:Connect(function()
+	refreshTooltip(false)
+end)
+luckPill.Activated:Connect(function()
+	tooltipPinned = not tooltipPinned
+	refreshTooltip(tooltipPinned)
+end)
 
 ---------------------------------------------------------------------
 -- INDEX: every tier, shown as "???" until you've rolled it
@@ -1341,8 +1484,8 @@ refreshWheelButton()
 local PASSES = {
 	{ key = "AutoRoll", name = "Auto Roll", desc = "Unlocks the AUTO button: rolls for you every 1.5s.", color = Color3.fromRGB(80, 200, 160) },
 	{ key = "Luck2x", name = "2x Luck", desc = "Permanently doubles your luck.", color = Color3.fromRGB(80, 220, 120) },
-	{ key = "FastRoll", name = "Fast Roll", desc = "A roll every 0.75s instead of 1.3s, with a snappier spin. Auto-roll goes 2x faster.", color = Color3.fromRGB(80, 170, 255) },
-	{ key = "VIP", name = "VIP Rank", desc = "+25% luck and a golden VIP tag over your head and in chat.", color = Color3.fromRGB(255, 215, 0) },
+	{ key = "FastRoll", name = "Fast Roll", desc = "Halves your roll cooldown (0.65s instead of 1.3s), with a snappier spin. Auto-roll goes 2x faster.", color = Color3.fromRGB(80, 170, 255) },
+	{ key = "VIP", name = "VIP Rank", desc = "+25% luck, a golden [VIP] tag over your head and a golden name in chat.", color = Color3.fromRGB(255, 215, 0) },
 }
 local IS_STUDIO = RunService:IsStudio()
 
@@ -2020,7 +2163,9 @@ announce.OnClientEvent:Connect(function(displayName, tierId, scale)
 	bannerStroke.Color = tier.color
 	banner.Position = UDim2.new(0.5, 0, 0, -100)
 	tween(banner, 0.4, { Position = UDim2.new(0.5, 0, 0, 56) }, Enum.EasingStyle.Back)
-	postToChat(text)
+	-- chat gets the rarity class in its color first: "[EPIC] Name rolled ..."
+	local class = RarityTable.ClassOf(tierId)
+	postToChat(colored("<b>[" .. class.name:upper() .. "]</b>", class.color) .. " " .. text)
 	if displayName ~= player.DisplayName then
 		playSound("rare", 0.5)
 	end
@@ -2033,14 +2178,14 @@ announce.OnClientEvent:Connect(function(displayName, tierId, scale)
 end)
 
 ---------------------------------------------------------------------
--- VIP CHAT TAG: golden [VIP] in front of VIP players' chat messages
+-- VIP CHAT TAG: golden [VIP] tag and golden name on VIP players' chat messages
 ---------------------------------------------------------------------
 TextChatService.OnIncomingMessage = function(message)
 	local properties = Instance.new("TextChatMessageProperties")
 	local source = message.TextSource
 	local sender = source and Players:GetPlayerByUserId(source.UserId)
 	if sender and sender:GetAttribute("VIP") then
-		properties.PrefixText = '<font color="#FFD700">[VIP]</font> ' .. message.PrefixText
+		properties.PrefixText = '<font color="#FFD700"><b>[VIP]</b> ' .. message.PrefixText .. "</font>"
 	end
 	return properties
 end
