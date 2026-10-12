@@ -15,7 +15,10 @@
 	  oneIn    - odds, "1 in N". Leave it out (nil) for exactly ONE tier:
 	             that tier gets whatever chance is left over.
 	  color    - main color for text and the aura
-	  aura     - character effect: "None", "Sparkles", "Glow", "Flames", "Starry", "Cosmic", "Nebula"
+	  aura     - character effect. By bracket: "Earth" (small/common, earth-tone motes),
+	             "Electric" (10x+, sparks + ground dust), "Embers" / "Void" (50x+),
+	             "Godly" (150x+, cosmic rings + footstep shockwaves). Tiny rare tiers
+	             keep their own: "Sparkles", "Glow", "Cosmic". Or "None".
 	  announce - true = the whole server gets a banner when someone rolls it
 ]]
 
@@ -41,22 +44,26 @@ RarityTable.Tiers = {
 	{ name = "Microbe",        title = "Germ of Legend",       scale = 0.05, oneIn = 50000,   color = rgb(90, 255, 140),  aura = "Glow",     announce = true },
 	{ name = "Ant",            title = "Tiny Terror",          scale = 0.1,  oneIn = 5000,    color = rgb(255, 150, 70),  aura = "Glow",     announce = true },
 	{ name = "Mouse",          title = "Cheese Seeker",        scale = 0.2,  oneIn = 750,     color = rgb(215, 215, 230), aura = "Sparkles", announce = false },
-	{ name = "Pebble",         title = "Kickable",             scale = 0.4,  oneIn = 60,      color = rgb(160, 160, 160), aura = "None",     announce = false },
-	{ name = "Pocket-Sized",   title = "Fits in a Backpack",   scale = 0.65, oneIn = 15,      color = rgb(170, 220, 255), aura = "None",     announce = false },
-	{ name = "Shorty",         title = "Fun-Sized",            scale = 0.85, oneIn = 5,       color = rgb(225, 225, 225), aura = "None",     announce = false },
-	{ name = "Average",        title = "Perfectly Normal",     scale = 1,    oneIn = nil,     color = rgb(255, 255, 255), aura = "None",     announce = false },
-	{ name = "Tall",           title = "Top Shelf Reacher",    scale = 1.15, oneIn = 5,       color = rgb(200, 235, 255), aura = "None",     announce = false },
-	{ name = "Lanky",          title = "All Legs",             scale = 1.35, oneIn = 10,      color = rgb(140, 200, 255), aura = "None",     announce = false },
-	{ name = "Towering",       title = "Door Ducker",          scale = 1.75, oneIn = 30,      color = rgb(90, 170, 255),  aura = "None",     announce = false },
-	{ name = "Tree",           title = "Walking Timber",       scale = 2.5,  oneIn = 120,     color = rgb(90, 210, 90),   aura = "Sparkles", announce = false },
-	{ name = "Giant",          title = "Fee-Fi-Fo-Fum",        scale = 4,    oneIn = 400,     color = rgb(255, 205, 60),  aura = "Sparkles", announce = false },
+	-- small / common tiers: muted earth tones
+	{ name = "Pebble",         title = "Kickable",             scale = 0.4,  oneIn = 60,      color = rgb(150, 145, 135), aura = "Earth",    announce = false },
+	{ name = "Pocket-Sized",   title = "Fits in a Backpack",   scale = 0.65, oneIn = 15,      color = rgb(150, 185, 130), aura = "Earth",    announce = false },
+	{ name = "Shorty",         title = "Fun-Sized",            scale = 0.85, oneIn = 5,       color = rgb(200, 175, 140), aura = "Earth",    announce = false },
+	{ name = "Average",        title = "Perfectly Normal",     scale = 1,    oneIn = nil,     color = rgb(225, 215, 195), aura = "Earth",    announce = false },
+	{ name = "Tall",           title = "Top Shelf Reacher",    scale = 1.15, oneIn = 5,       color = rgb(165, 195, 150), aura = "Earth",    announce = false },
+	{ name = "Lanky",          title = "All Legs",             scale = 1.35, oneIn = 10,      color = rgb(175, 170, 110), aura = "Earth",    announce = false },
+	{ name = "Towering",       title = "Door Ducker",          scale = 1.75, oneIn = 30,      color = rgb(190, 130, 90),  aura = "Earth",    announce = false },
+	{ name = "Tree",           title = "Walking Timber",       scale = 2.5,  oneIn = 120,     color = rgb(110, 150, 80),  aura = "Earth",    announce = false },
+	{ name = "Giant",          title = "Fee-Fi-Fo-Fum",        scale = 4,    oneIn = 400,     color = rgb(215, 180, 120), aura = "Earth",    announce = false },
 	{ name = "Lighthouse",     title = "Beacon of the Coast",  scale = 7,    oneIn = 1500,    color = rgb(255, 240, 150), aura = "Glow",     announce = true },
-	{ name = "Skyscraper",     title = "Cloud Scraper",        scale = 12,   oneIn = 6000,    color = rgb(120, 220, 255), aura = "Glow",     announce = true },
-	{ name = "Mountain",       title = "Peak Performer",       scale = 20,   oneIn = 25000,   color = rgb(255, 150, 60),  aura = "Flames",   announce = true },
-	{ name = "Colossus",       title = "Earth Shaker",         scale = 35,   oneIn = 80000,   color = rgb(255, 80, 40),   aura = "Starry",   announce = true },
-	{ name = "Storm Titan",    title = "Lord of Thunder",      scale = 60,   oneIn = 200000,  color = rgb(120, 160, 255), aura = "Cosmic",   announce = true },
-	{ name = "Planet Breaker", title = "Moon Kicker",          scale = 100,  oneIn = 400000,  color = rgb(255, 60, 200),  aura = "Cosmic",   announce = true },
-	{ name = "World Eater",    title = "Devourer of Worlds",   scale = 200,  oneIn = 1000000, color = rgb(255, 20, 60),   aura = "Nebula",   announce = true },
+	-- mid tiers (10x+): electric blue / gold
+	{ name = "Skyscraper",     title = "Cloud Scraper",        scale = 12,   oneIn = 6000,    color = rgb(70, 170, 255),  aura = "Electric", announce = true },
+	{ name = "Mountain",       title = "Peak Performer",       scale = 20,   oneIn = 25000,   color = rgb(255, 200, 70),  aura = "Electric", announce = true },
+	{ name = "Colossus",       title = "Earth Shaker",         scale = 35,   oneIn = 80000,   color = rgb(90, 200, 255),  aura = "Electric", announce = true },
+	-- giant tiers (50x+): embers and void
+	{ name = "Storm Titan",    title = "Lord of Thunder",      scale = 60,   oneIn = 200000,  color = rgb(255, 120, 50),  aura = "Embers",   announce = true },
+	{ name = "Planet Breaker", title = "Moon Kicker",          scale = 100,  oneIn = 400000,  color = rgb(160, 90, 230),  aura = "Void",     announce = true },
+	-- god tier (150x+)
+	{ name = "World Eater",    title = "Devourer of Worlds",   scale = 200,  oneIn = 1000000, color = rgb(255, 20, 60),   aura = "Godly",    announce = true },
 }
 
 local Tiers = RarityTable.Tiers
@@ -115,7 +122,7 @@ function RarityTable.Roll(luck, rng)
 end
 
 -- A roll that can only land on tiers at least 1 in minOneIn rare, keeping
--- their odds relative to each other. Used by the wheel's Titan Pity Roll.
+-- their odds relative to each other. Used by the Growth Spinner's Titan Surge.
 function RarityTable.RollAtLeast(minOneIn, rng)
 	local total = 0
 	local leastRare = nil

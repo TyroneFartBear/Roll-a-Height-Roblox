@@ -34,21 +34,38 @@ local GROUP_ID = 5353332 -- placeholder: set this to your group's id
 local GROUP_BOOST = 0.15 -- flat +15% luck for group members, stacks with friend boost
 local MAX_LUCK = 25 -- all boosts together are capped here; RarityTable stays balanced up to ~25x
 
--- Rags to Riches: Growth Essence from common rolls, spent on the Gambler's Wheel
+-- Rags to Riches: Growth Essence from common rolls, spent on the Growth Spinner
 local ESSENCE_MAX_ONE_IN = 100 -- only rolls more common than 1 in 100 give Essence (1-3, rarer = more)
 local ESSENCE_PER_SPIN = 50
-local WHEEL_SPIN_TIME = 4 -- seconds the wheel spins before the prize
+local WHEEL_SPIN_TIME = 4 -- seconds the spinner spins before the prize
 local WHEEL_LUCK_BOOST = 0.15
 local WHEEL_LUCK_TIME = 60
-local SURGE_BOOST = 1.0 -- Super Surge: +100% luck
-local JACKPOT_MULT = 10
-local WHEEL = { -- weights must add up to 100: the physical wheel has 100 rim tiles, in this order
-	{ key = "Luck15", weight = 45, label = "+15% Luck for 60 seconds", color = Color3.fromRGB(80, 170, 255) },
-	{ key = "FreeRolls", weight = 30, label = "3 Instant Free Rolls!", color = Color3.fromRGB(80, 220, 120) },
-	{ key = "SuperSurge", weight = 15, label = "SUPER SURGE!  +100% Luck for 3 rolls", color = Color3.fromRGB(180, 90, 255) },
-	{ key = "TitanPity", weight = 8, label = "TITAN PITY ROLL!  Guaranteed 1 in 500 or rarer", color = Color3.fromRGB(255, 140, 40) },
-	{ key = "Jackpot", weight = 2, label = "JACKPOT!!  10x Luck for your next 5 rolls", color = Color3.fromRGB(255, 215, 0) },
+local FAST_ROLL_PRIZE = 5 -- "5 Instant Fast Rolls"
+local SKY_JUMP_MULT = 3 -- Sky Jump: jump height x3...
+local SKY_JUMP_TIME = 120 -- ...for this many seconds
+local OVERCHARGE_BOOST = 1.0 -- Growth Overcharge: +100% luck...
+local OVERCHARGE_ROLLS = 5 -- ...for this many rolls
+local TITAN_SURGE_MIN_ONE_IN = 250 -- Titan Surge: guaranteed 1 in 250 or rarer
+local GODSPEED_MULT = 10 -- Godspeed: 10x luck...
+local GODSPEED_ROLLS = 3 -- ...for this many rolls
+local WHEEL = { -- weights must add up to 100: the physical spinner has 100 rim tiles, in this order
+	{ key = "Luck15", rarity = "Common", weight = 40, label = "+15% Luck for 60 seconds", color = Color3.fromRGB(112, 128, 144) },
+	{ key = "FastRolls", rarity = "Uncommon", weight = 27, label = "5 Instant Fast Rolls!", color = Color3.fromRGB(120, 210, 70) },
+	{ key = "SkyJump", rarity = "Rare", weight = 16, label = "SKY JUMP!  3x jump height for 2 minutes", color = Color3.fromRGB(110, 190, 240) },
+	{ key = "Overcharge", rarity = "Epic", weight = 10, label = "GROWTH OVERCHARGE!  +100% Luck for 5 rolls", color = Color3.fromRGB(155, 100, 210) },
+	{ key = "TitanSurge", rarity = "Legendary", weight = 5, label = "TITAN SURGE!  Guaranteed 1 in 250 or rarer", color = Color3.fromRGB(250, 175, 70) },
+	{ key = "Godspeed", rarity = "Mythic", weight = 2, label = "GODSPEED!!  10x Luck for your next 3 rolls", color = Color3.fromRGB(255, 130, 210) },
 }
+
+-- Crush Pit (Workspace.Lobby.CrushPit): giants bounce small players, both earn Essence
+local PIT_SMALL_MAX_SCALE = 2 -- players this size or smaller get bounced...
+local PIT_GIANT_MIN_SCALE = 10 -- ...by the feet of players this size or bigger
+local PIT_BOUNCE_UP = 90
+local PIT_BOUNCE_OUT = 70
+local PIT_BOUNCE_COOLDOWN = 1.5 -- seconds before the same player can be bounced again
+local PIT_ESSENCE_BOUNCED = 3 -- for the small player
+local PIT_ESSENCE_STOMPER = 2 -- for the giant
+local PIT_PARTICIPATION_ESSENCE = 1 -- everyone in the pit, every 10s while giants and small players share it
 
 -- Sky Realm (cloud layers, altars and orbs are built in Studio and found by tag)
 local SKY_BLESSING = 0.25 -- +25% luck after touching a Sky Altar, while you stand over a cloud
@@ -58,11 +75,12 @@ local ORB_LUCK_MULT = 1.5
 
 -- Gamepasses: put your real gamepass ids here (0 = not on sale yet)
 local GAMEPASSES = {
+	AutoRoll = { id = 0, name = "Auto Roll" },
 	Luck2x = { id = 0, name = "2x Luck" },
 	FastRoll = { id = 0, name = "Fast Roll" },
-	VIP = { id = 0, name = "VIP" },
+	VIP = { id = 0, name = "VIP Rank" },
 }
-local STUDIO_PASSES = { Luck2x = false, FastRoll = false, VIP = false } -- Studio playtests start with these on
+local DEBUG_UNLOCK_PASSES = true -- Studio playtests only: every pass starts unlocked. Never applies in the live game.
 local VIP_BOOST = 0.25
 local FAST_ROLL_COOLDOWN = 0.35
 local FAST_SPIN_TIME = 0.4
@@ -87,9 +105,10 @@ local announce = newRemote("Announce") -- server -> everyone: "someone rolled so
 local equipBest = newRemote("EquipBest") -- client -> server: "go back to my best height"
 local devForceRoll = newRemote("DevForceRoll") -- Studio-only testing shortcut
 local equipTier = newRemote("EquipTier") -- client -> server: "equip this tier from my Index"
-local spinWheel = newRemote("SpinWheel") -- client -> server: "spin the Gambler's Wheel"
+local spinWheel = newRemote("SpinWheel") -- client -> server: "spin the Growth Spinner"
 local shopRequest = newRemote("ShopRequest") -- client -> server: "buy this pass" (Studio: toggle it)
 local notify = newRemote("Notify") -- server -> one client: a short message for the toast
+local bounce = newRemote("Bounce") -- server -> one client: "a giant just bounced you" (Crush Pit)
 for key, pass in pairs(GAMEPASSES) do
 	remotes:SetAttribute("PassId_" .. key, pass.id) -- the shop reads these to show prices
 end
@@ -130,10 +149,12 @@ local function newEffects()
 		sky = false, -- Sky Blessing, lost when you leave the clouds
 		wheelLuckUntil = 0, -- os.clock() when the wheel's +15% ends
 		orbUntil = 0, -- os.clock() when a Sky Orb's 1.5x ends
-		surgeRolls = 0, -- rolls left with Super Surge
-		jackpotRolls = 0, -- rolls left with Jackpot
-		bonusRolls = 0, -- free rolls waiting to be played
+		skyJumpUntil = 0, -- os.clock() when Sky Jump ends
+		overchargeRolls = 0, -- rolls left with Growth Overcharge
+		godspeedRolls = 0, -- rolls left with Godspeed
+		bonusQueue = {}, -- free rolls waiting to be played (true = fast roll)
 		bonusRunning = false,
+		lastSpinTime = 0, -- spin length of the last roll, so free rolls wait for it
 		wheelBusy = false,
 	}
 end
@@ -342,11 +363,11 @@ end
 
 local SMOKE_TEXTURE = "rbxasset://textures/particles/smoke_main.dds"
 
-local function addNebula(root, scale)
+local function addNebula(root, scale, fromColor, toColor)
 	local emitter = Instance.new("ParticleEmitter")
 	emitter.Name = AURA_NAME
 	emitter.Texture = SMOKE_TEXTURE
-	emitter.Color = ColorSequence.new(Color3.fromRGB(90, 20, 140), Color3.fromRGB(10, 10, 40))
+	emitter.Color = ColorSequence.new(fromColor, toColor)
 	emitter.LightEmission = 0.4
 	emitter.Transparency = NumberSequence.new(0.35, 1)
 	emitter.Rate = 12
@@ -357,6 +378,52 @@ local function addNebula(root, scale)
 	emitter.RotSpeed = NumberRange.new(-20, 20)
 	emitter.SpreadAngle = Vector2.new(180, 180)
 	emitter.Parent = root
+end
+
+local function addMotes(root, color, scale)
+	local emitter = Instance.new("ParticleEmitter")
+	emitter.Name = AURA_NAME
+	emitter.Texture = SPARKLE_TEXTURE
+	emitter.Color = ColorSequence.new(color)
+	emitter.LightEmission = 0.2
+	emitter.Transparency = NumberSequence.new(0.3, 1)
+	emitter.Rate = 3
+	emitter.Lifetime = NumberRange.new(1.5, 2.5)
+	emitter.Size = NumberSequence.new(0.3 * scale, 0)
+	emitter.Speed = NumberRange.new(0.5 * scale, 1 * scale)
+	emitter.SpreadAngle = Vector2.new(180, 180)
+	emitter.Parent = root
+end
+
+local function addLight(root, color, scale)
+	local light = Instance.new("PointLight")
+	light.Name = AURA_NAME
+	light.Color = color
+	light.Brightness = 1.5
+	light.Range = math.clamp(6 * scale, 4, 60)
+	light.Parent = root
+end
+
+-- Dust puffing up around the feet (an attachment at ground level under the root).
+local function addGroundDust(character, root, scale)
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	local feet = Instance.new("Attachment")
+	feet.Name = AURA_NAME
+	feet.Position = Vector3.new(0, -(root.Size.Y / 2 + (humanoid and humanoid.HipHeight or 0)), 0)
+	feet.Parent = root
+	local dust = Instance.new("ParticleEmitter")
+	dust.Name = AURA_NAME
+	dust.Texture = SMOKE_TEXTURE
+	dust.Color = ColorSequence.new(Color3.fromRGB(170, 150, 120))
+	dust.LightEmission = 0
+	dust.Transparency = NumberSequence.new(0.6, 1)
+	dust.Size = NumberSequence.new(0.5 * scale, 1.5 * scale)
+	dust.Lifetime = NumberRange.new(1.5, 2.5)
+	dust.Rate = 6
+	dust.Speed = NumberRange.new(0.2 * scale, 0.6 * scale)
+	dust.SpreadAngle = Vector2.new(90, 90)
+	dust.Acceleration = Vector3.new(0, 0.1 * scale, 0)
+	dust.Parent = feet
 end
 
 local function applyAura(character, tier, scale)
@@ -370,20 +437,33 @@ local function applyAura(character, tier, scale)
 	elseif tier.aura == "Glow" then
 		addGlow(character, root, tier.color, scale)
 		addEmitter(root, SPARKLE_TEXTURE, tier.color, scale, 15, false)
-	elseif tier.aura == "Flames" then
-		addGlow(character, root, tier.color, scale)
-		addEmitter(root, FIRE_TEXTURE, tier.color, scale, 30, true)
-	elseif tier.aura == "Starry" then
-		addGlow(character, root, tier.color, scale)
-		addEmitter(root, SPARKLE_TEXTURE, Color3.fromRGB(255, 245, 200), scale * 1.2, 35, false) -- twinkling stars
-		addEmitter(root, FIRE_TEXTURE, tier.color, scale, 20, true)
 	elseif tier.aura == "Cosmic" then
 		addGlow(character, root, tier.color, scale)
 		addEmitter(root, FIRE_TEXTURE, tier.color, scale, 25, true)
 		addEmitter(root, SPARKLE_TEXTURE, Color3.new(1, 1, 1), scale * 1.5, 40, false)
-	elseif tier.aura == "Nebula" then
+	elseif tier.aura == "Earth" then
+		-- small / common tiers: a few drifting earth-tone motes
+		addMotes(root, tier.color, scale)
+	elseif tier.aura == "Electric" then
+		-- mid tiers: electric sparks with gold accents, dust kicked up at the feet
+		addLight(root, tier.color, scale)
+		addEmitter(root, SPARKLE_TEXTURE, tier.color, scale, 20, false)
+		addEmitter(root, SPARKLE_TEXTURE, Color3.fromRGB(255, 210, 90), scale * 0.7, 10, false)
+		addGroundDust(character, root, scale)
+	elseif tier.aura == "Embers" then
 		addGlow(character, root, tier.color, scale)
-		addNebula(root, scale) -- dark cosmic clouds
+		addEmitter(root, FIRE_TEXTURE, tier.color, scale, 30, true)
+		addEmitter(root, SPARKLE_TEXTURE, Color3.fromRGB(255, 170, 60), scale * 0.5, 25, true) -- drifting embers
+		addGroundDust(character, root, scale)
+	elseif tier.aura == "Void" then
+		-- the void crystals orbiting the body are drawn by each client (RollClient)
+		addGlow(character, root, tier.color, scale)
+		addNebula(root, scale, Color3.fromRGB(70, 20, 110), Color3.fromRGB(15, 5, 30))
+		addGroundDust(character, root, scale)
+	elseif tier.aura == "Godly" then
+		-- the cosmic rings and footstep shockwaves are drawn by each client (RollClient)
+		addGlow(character, root, tier.color, scale)
+		addNebula(root, scale, Color3.fromRGB(90, 20, 140), Color3.fromRGB(10, 10, 40))
 		addEmitter(root, SPARKLE_TEXTURE, Color3.new(1, 1, 1), scale * 1.5, 40, false)
 	end
 end
@@ -422,7 +502,9 @@ local function applyHeight(player)
 	humanoid.HipHeight = character:GetAttribute("BaseHipHeight") * scale
 	humanoid.WalkSpeed = BASE_WALKSPEED * math.sqrt(scale) -- big = faster, but not 200x faster
 	humanoid.UseJumpPower = false
-	humanoid.JumpHeight = BASE_JUMP_HEIGHT * scale ^ 0.75
+	local fx = effects[player]
+	local jumpBoost = (fx and os.clock() < fx.skyJumpUntil) and SKY_JUMP_MULT or 1
+	humanoid.JumpHeight = BASE_JUMP_HEIGHT * scale ^ 0.75 * jumpBoost
 
 	local newCFrame, newSize = character:GetBoundingBox()
 	local newFeetY = newCFrame.Position.Y - newSize.Y / 2
@@ -565,8 +647,8 @@ local function computeLuck(player)
 		if now < fx.wheelLuckUntil then
 			bonus(WHEEL_LUCK_BOOST, ("Wheel +%d%% (%ds)"):format(pct(WHEEL_LUCK_BOOST), math.ceil(fx.wheelLuckUntil - now)))
 		end
-		if fx.surgeRolls > 0 then
-			bonus(SURGE_BOOST, ("Super Surge +%d%% (%s)"):format(pct(SURGE_BOOST), rollsLeft(fx.surgeRolls)))
+		if fx.overchargeRolls > 0 then
+			bonus(OVERCHARGE_BOOST, ("Growth Overcharge +%d%% (%s)"):format(pct(OVERCHARGE_BOOST), rollsLeft(fx.overchargeRolls)))
 		end
 		if fx.passes.Luck2x then
 			mult *= 2
@@ -576,9 +658,12 @@ local function computeLuck(player)
 			mult *= ORB_LUCK_MULT
 			table.insert(parts, ("Orb Surge x%s (%ds)"):format(tostring(ORB_LUCK_MULT), math.ceil(fx.orbUntil - now)))
 		end
-		if fx.jackpotRolls > 0 then
-			mult *= JACKPOT_MULT
-			table.insert(parts, ("JACKPOT x%d (%s)"):format(JACKPOT_MULT, rollsLeft(fx.jackpotRolls)))
+		if fx.godspeedRolls > 0 then
+			mult *= GODSPEED_MULT
+			table.insert(parts, ("GODSPEED x%d (%s)"):format(GODSPEED_MULT, rollsLeft(fx.godspeedRolls)))
+		end
+		if now < fx.skyJumpUntil then -- not luck, but shown on the badge with the other boosts
+			table.insert(parts, ("Sky Jump x%d (%ds)"):format(SKY_JUMP_MULT, math.ceil(fx.skyJumpUntil - now)))
 		end
 	end
 
@@ -680,8 +765,9 @@ local function essenceFor(tierId)
 	return 1
 end
 
--- opts.ignoreCooldown: free/pity rolls skip the cooldown
--- opts.minOneIn: only land on tiers at least this rare (Titan Pity Roll)
+-- opts.ignoreCooldown: free/surge rolls skip the cooldown
+-- opts.minOneIn: only land on tiers at least this rare (Titan Surge)
+-- opts.fast: use the short Fast Roll spin
 local function doRoll(player, forcedTierId, opts)
 	opts = opts or {}
 	local data, fx = playerData[player], effects[player]
@@ -702,11 +788,11 @@ local function doRoll(player, forcedTierId, opts)
 	else
 		tierId, scale = RarityTable.Roll(getLuck(player), rng)
 		-- per-roll boosts are used up by normal rolls only
-		if fx.surgeRolls > 0 then
-			fx.surgeRolls -= 1
+		if fx.overchargeRolls > 0 then
+			fx.overchargeRolls -= 1
 		end
-		if fx.jackpotRolls > 0 then
-			fx.jackpotRolls -= 1
+		if fx.godspeedRolls > 0 then
+			fx.godspeedRolls -= 1
 		end
 	end
 	local tier = Tiers[tierId]
@@ -722,7 +808,8 @@ local function doRoll(player, forcedTierId, opts)
 	end
 
 	-- Tell the roller right away so their spin animation can start...
-	local spinTime = hasPass(player, "FastRoll") and FAST_SPIN_TIME or SPIN_TIME
+	local spinTime = (opts.fast or hasPass(player, "FastRoll")) and FAST_SPIN_TIME or SPIN_TIME
+	fx.lastSpinTime = spinTime
 	rollResult:FireClient(player, tierId, scale, isNewBest, spinTime, essence)
 
 	-- ...and only change the body when the spin finishes, for the big reveal.
@@ -740,27 +827,30 @@ local function doRoll(player, forcedTierId, opts)
 end
 
 -- Free rolls are played one after another, each after the previous spin ends.
-local function queueBonusRolls(player, count)
+-- fast = use the short Fast Roll spin (the spinner's "5 Instant Fast Rolls").
+local function queueBonusRolls(player, count, fast)
 	local fx = effects[player]
 	if not fx then
 		return
 	end
-	fx.bonusRolls += count
+	for _ = 1, count do
+		table.insert(fx.bonusQueue, fast == true)
+	end
 	if fx.bonusRunning then
 		return
 	end
 	fx.bonusRunning = true
 	task.spawn(function()
-		while fx.bonusRolls > 0 and player.Parent do
-			local waitFor = (lastRollTime[player] or 0) + SPIN_TIME + 0.6 - os.clock()
+		while #fx.bonusQueue > 0 and player.Parent do
+			local waitFor = (lastRollTime[player] or 0) + fx.lastSpinTime + 0.4 - os.clock()
 			if waitFor > 0 then
 				task.wait(waitFor)
 			end
 			if not player.Parent then
 				break
 			end
-			fx.bonusRolls -= 1
-			doRoll(player, nil, { ignoreCooldown = true })
+			local isFast = table.remove(fx.bonusQueue, 1)
+			doRoll(player, nil, { ignoreCooldown = true, fast = isFast })
 		end
 		fx.bonusRunning = false
 	end)
@@ -821,6 +911,17 @@ local function playerFromHit(hit)
 	return model and Players:GetPlayerFromCharacter(model)
 end
 
+-- Re-apply jump height after Sky Jump starts or ends.
+local function refreshJump(player)
+	local character = player.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	local fx = effects[player]
+	if humanoid and fx then
+		local jumpBoost = os.clock() < fx.skyJumpUntil and SKY_JUMP_MULT or 1
+		humanoid.JumpHeight = BASE_JUMP_HEIGHT * character:GetScale() ^ 0.75 * jumpBoost
+	end
+end
+
 ---------------------------------------------------------------------
 -- SKY REALM: altars (tag "SkyAltar") and orbs (tag "SkyOrb")
 ---------------------------------------------------------------------
@@ -837,7 +938,7 @@ local function connectAltar(altar)
 end
 
 local function setOrbVisible(orb, visible)
-	orb.Transparency = visible and 0 or 1
+	orb.Transparency = visible and (orb:GetAttribute("BaseTransparency") or 0) or 1
 	for _, obj in ipairs(orb:GetDescendants()) do
 		if obj:IsA("Light") or obj:IsA("ParticleEmitter") or obj:IsA("BillboardGui") then
 			obj.Enabled = visible
@@ -908,6 +1009,11 @@ task.spawn(function()
 					tell(player, "Your Sky Blessing faded: you left the clouds.", GREY)
 				end
 			end
+			if fx.skyJumpUntil > 0 and os.clock() >= fx.skyJumpUntil then
+				fx.skyJumpUntil = 0
+				refreshJump(player)
+				tell(player, "Sky Jump wore off.", GREY)
+			end
 			if player.Parent then
 				refreshLuckInfo(player)
 			end
@@ -916,12 +1022,12 @@ task.spawn(function()
 end)
 
 ---------------------------------------------------------------------
--- GAMBLER'S WHEEL (Workspace.Lobby.GamblersWheel, built in Studio)
+-- GROWTH SPINNER (Workspace.Lobby.GrowthSpinner, built in Studio)
 ---------------------------------------------------------------------
 local WHEEL_TILES = 100
 local HUB_TILT = CFrame.Angles(0, math.rad(90), 0) -- the hub is a cylinder, which spins around its X axis
 local lobby = workspace:FindFirstChild("Lobby")
-local wheelModel = lobby and lobby:FindFirstChild("GamblersWheel")
+local wheelModel = lobby and lobby:FindFirstChild("GrowthSpinner")
 local wheelHub = wheelModel and wheelModel:FindFirstChild("Hub")
 local wheelBase = wheelModel and wheelModel:GetAttribute("BaseCFrame")
 local wheelAngle = Instance.new("NumberValue")
@@ -929,6 +1035,26 @@ local wheelTween = nil
 if wheelHub and wheelBase then
 	wheelAngle.Changed:Connect(function(angle)
 		wheelHub.CFrame = wheelBase * CFrame.Angles(0, 0, angle) * HUB_TILT
+	end)
+end
+
+-- The Mythic slice's tiles (attribute "Prismatic") slowly cycle through the rainbow.
+local prismaticTiles = {}
+for _, obj in ipairs(wheelModel and wheelModel:GetDescendants() or {}) do
+	if obj:IsA("BasePart") and obj:GetAttribute("Prismatic") then
+		table.insert(prismaticTiles, obj)
+	end
+end
+if #prismaticTiles > 0 then
+	task.spawn(function()
+		local hue = 0
+		while true do
+			hue = (hue + 0.01) % 1
+			for i, tile in ipairs(prismaticTiles) do
+				tile.Color = Color3.fromHSV((hue + i * 0.12) % 1, 0.45, 1)
+			end
+			task.wait(0.1)
+		end
 	end)
 end
 
@@ -967,17 +1093,20 @@ local function giveWheelPrize(player, key)
 	local fx = effects[player]
 	if key == "Luck15" then
 		fx.wheelLuckUntil = os.clock() + WHEEL_LUCK_TIME
-	elseif key == "FreeRolls" then
-		queueBonusRolls(player, 3)
-	elseif key == "SuperSurge" then
-		fx.surgeRolls += 3
-	elseif key == "TitanPity" then
-		doRoll(player, nil, { ignoreCooldown = true, minOneIn = 500 })
-	elseif key == "Jackpot" then
-		fx.jackpotRolls += 5
+	elseif key == "FastRolls" then
+		queueBonusRolls(player, FAST_ROLL_PRIZE, true)
+	elseif key == "SkyJump" then
+		fx.skyJumpUntil = os.clock() + SKY_JUMP_TIME
+		refreshJump(player)
+	elseif key == "Overcharge" then
+		fx.overchargeRolls += OVERCHARGE_ROLLS
+	elseif key == "TitanSurge" then
+		doRoll(player, nil, { ignoreCooldown = true, minOneIn = TITAN_SURGE_MIN_ONE_IN })
+	elseif key == "Godspeed" then
+		fx.godspeedRolls += GODSPEED_ROLLS
 		for _, other in ipairs(Players:GetPlayers()) do
 			if other ~= player then
-				tell(other, player.DisplayName .. " hit the JACKPOT on the Gambler's Wheel!", GOLD)
+				tell(other, player.DisplayName .. " hit GODSPEED on the Growth Spinner!", GOLD)
 			end
 		end
 	end
@@ -998,12 +1127,12 @@ local function spinWheelFor(player)
 	fx.wheelBusy = true
 	local index = pickWheelSegment()
 	spinWheelModel(index)
-	tell(player, "The Gambler's Wheel is spinning...", Color3.fromRGB(200, 150, 255))
+	tell(player, "The Growth Spinner is spinning...", Color3.fromRGB(200, 190, 230))
 	task.delay(WHEEL_SPIN_TIME, function()
 		fx.wheelBusy = false
 		if player.Parent and effects[player] then
 			giveWheelPrize(player, WHEEL[index].key)
-			tell(player, WHEEL[index].label, WHEEL[index].color)
+			tell(player, ("%s: %s"):format(WHEEL[index].rarity:upper(), WHEEL[index].label), WHEEL[index].color)
 		end
 	end)
 end
@@ -1012,6 +1141,131 @@ spinWheel.OnServerEvent:Connect(spinWheelFor)
 local wheelPrompt = wheelHub and wheelHub:FindFirstChildOfClass("ProximityPrompt")
 if wheelPrompt then
 	wheelPrompt.Triggered:Connect(spinWheelFor)
+end
+
+---------------------------------------------------------------------
+-- CRUSH PIT (Workspace.Lobby.CrushPit, built in Studio)
+-- Giants (10x+) walking through the pit bounce small players (2x or less)
+-- off their feet: no damage, just a launch. Both sides earn Essence.
+---------------------------------------------------------------------
+local pitModel = lobby and lobby:FindFirstChild("CrushPit")
+local pitCenter = pitModel and pitModel:GetAttribute("Center")
+local pitRadius = pitModel and pitModel:GetAttribute("Radius")
+local pitScores = {} -- [player] = bounces given + taken this server
+local lastBounced = {} -- [player] = os.clock() of their last bounce
+
+local function giveEssence(player, amount)
+	local data = playerData[player]
+	if data and amount > 0 then
+		data.essence += amount
+		player:SetAttribute("Essence", data.essence)
+	end
+end
+
+local function updatePitBoard()
+	local display = pitModel and pitModel:FindFirstChild("Display", true)
+	if not display then
+		return
+	end
+	local entries = {}
+	for player, score in pairs(pitScores) do
+		if player.Parent and score > 0 then
+			table.insert(entries, { name = player.DisplayName, score = score })
+		end
+	end
+	table.sort(entries, function(a, b)
+		return a.score > b.score
+	end)
+	for i = 1, 3 do
+		local row = display:FindFirstChild("Row" .. i, true)
+		if row then
+			local entry = entries[i]
+			row.Text = entry and ("%d.  %s   %d bounces"):format(i, escapeRichText(entry.name), entry.score) or (i .. ".  ---")
+		end
+	end
+end
+
+local function inPit(position)
+	local offset = position - pitCenter
+	return Vector2.new(offset.X, offset.Z).Magnitude <= pitRadius
+end
+
+local function bounceSmall(victim, giant, foot)
+	local root = victim.Character and victim.Character:FindFirstChild("HumanoidRootPart")
+	if not root then
+		return
+	end
+	local away = (root.Position - foot.Position) * Vector3.new(1, 0, 1)
+	if away.Magnitude < 0.1 then
+		away = Vector3.new(rng:NextNumber(-1, 1), 0, rng:NextNumber(-1, 1))
+	end
+	bounce:FireClient(victim, away.Unit * PIT_BOUNCE_OUT + Vector3.new(0, PIT_BOUNCE_UP, 0))
+	giveEssence(victim, PIT_ESSENCE_BOUNCED)
+	giveEssence(giant, PIT_ESSENCE_STOMPER)
+	pitScores[victim] = (pitScores[victim] or 0) + 1
+	pitScores[giant] = (pitScores[giant] or 0) + 1
+	tell(victim, ("BOING! %s bounced you  +%d Essence"):format(giant.DisplayName, PIT_ESSENCE_BOUNCED), GOLD)
+	tell(giant, ("STOMP! You bounced %s  +%d Essence"):format(victim.DisplayName, PIT_ESSENCE_STOMPER), GOLD)
+	updatePitBoard()
+end
+
+if pitCenter and pitRadius then
+	local pitOverlap = OverlapParams.new()
+	pitOverlap.FilterType = Enum.RaycastFilterType.Include
+	local nextParticipation = os.clock() + 10
+	task.spawn(function()
+		while true do
+			task.wait(0.1)
+			local smalls, smallCharacters, giants = {}, {}, {}
+			for _, player in ipairs(Players:GetPlayers()) do
+				local character = player.Character
+				local root = character and character:FindFirstChild("HumanoidRootPart")
+				local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+				if root and humanoid and humanoid.Health > 0 and playerData[player] then
+					local scale = character:GetScale()
+					if scale >= PIT_GIANT_MIN_SCALE then
+						-- a giant is "in" when a foot is over the pit (its root can be far outside)
+						local left, right = character:FindFirstChild("LeftFoot"), character:FindFirstChild("RightFoot")
+						if (left and inPit(left.Position)) or (right and inPit(right.Position)) then
+							table.insert(giants, player)
+						end
+					elseif scale <= PIT_SMALL_MAX_SCALE and inPit(root.Position) then
+						table.insert(smalls, player)
+						table.insert(smallCharacters, character)
+					end
+				end
+			end
+			if #giants > 0 and #smalls > 0 then
+				pitOverlap.FilterDescendantsInstances = smallCharacters
+				for _, giant in ipairs(giants) do
+					for _, footName in ipairs({ "LeftFoot", "RightFoot" }) do
+						local foot = giant.Character and giant.Character:FindFirstChild(footName)
+						if foot then
+							local zone = foot.Size * 1.4 + Vector3.new(4, 4, 4)
+							for _, part in ipairs(workspace:GetPartBoundsInBox(foot.CFrame, zone, pitOverlap)) do
+								local victim = playerFromHit(part)
+								if victim and os.clock() - (lastBounced[victim] or 0) > PIT_BOUNCE_COOLDOWN then
+									lastBounced[victim] = os.clock()
+									bounceSmall(victim, giant, foot)
+								end
+							end
+						end
+					end
+				end
+				if os.clock() >= nextParticipation then
+					nextParticipation = os.clock() + 10
+					for _, player in ipairs(smalls) do
+						giveEssence(player, PIT_PARTICIPATION_ESSENCE)
+					end
+					for _, player in ipairs(giants) do
+						giveEssence(player, PIT_PARTICIPATION_ESSENCE)
+					end
+				end
+			else
+				nextParticipation = os.clock() + 10
+			end
+		end
+	end)
 end
 
 ---------------------------------------------------------------------
@@ -1034,7 +1288,7 @@ end
 local function loadPasses(player)
 	for key, pass in pairs(GAMEPASSES) do
 		local owned = false
-		if RunService:IsStudio() and STUDIO_PASSES[key] then
+		if RunService:IsStudio() and DEBUG_UNLOCK_PASSES then
 			owned = true
 		elseif pass.id ~= 0 then
 			local ok, result = pcall(MarketplaceService.UserOwnsGamePassAsync, MarketplaceService, player.UserId, pass.id)
@@ -1138,7 +1392,10 @@ Players.PlayerRemoving:Connect(function(player)
 	playerData[player] = nil
 	lastRollTime[player] = nil
 	effects[player] = nil
+	pitScores[player] = nil
+	lastBounced[player] = nil
 	updateBoard()
+	updatePitBoard()
 end)
 
 game:BindToClose(function()

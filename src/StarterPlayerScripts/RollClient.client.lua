@@ -30,6 +30,7 @@ local equipTier = remotes:WaitForChild("EquipTier")
 local spinWheel = remotes:WaitForChild("SpinWheel")
 local shopRequest = remotes:WaitForChild("ShopRequest")
 local notify = remotes:WaitForChild("Notify")
+local bounce = remotes:WaitForChild("Bounce")
 
 local player = Players.LocalPlayer
 
@@ -44,6 +45,7 @@ local AUTO_ROLL_INTERVAL = 1.5 -- seconds between auto-rolls
 local FAST_AUTO_ROLL_INTERVAL = 0.45 -- with the Fast Roll pass
 local FOOTSTEP_MIN_SCALE = 10 -- characters this big (or bigger) shake the ground
 local THUD_SOUND = "rbxasset://sounds/action_footsteps_plastic.mp3" -- played slowed down = deep thud
+local SHOCKWAVE_MIN_SCALE = 150 -- god tiers send a shockwave ring out on every footstep
 
 -- Paste sound IDs from the Creator Store here, e.g. "rbxassetid://12345".
 -- Left empty = no sound (nothing breaks).
@@ -446,6 +448,119 @@ local function pop(fromScale, time)
 end
 
 ---------------------------------------------------------------------
+-- TIER EFFECTS drawn on this screen only (not replicated): void crystals
+-- orbiting "Void" tiers, cosmic rings around "Godly" tiers, and the god
+-- tier's footstep shockwaves.
+---------------------------------------------------------------------
+local fxFolder = Instance.new("Folder")
+fxFolder.Name = "LocalTierEffects"
+fxFolder.Parent = workspace
+local orbiters = {} -- [player] = { character, aura, scale, parts, specs, t }
+
+local function effectPart(props)
+	props.Anchored = true
+	props.CanCollide = false
+	props.CanQuery = false
+	props.CanTouch = false
+	props.CastShadow = false
+	props.Parent = fxFolder
+	return make("Part", props)
+end
+
+local function buildOrbiters(aura, scale)
+	local parts, specs = {}, {}
+	if aura == "Void" then
+		for i = 1, 6 do
+			table.insert(parts, effectPart({
+				Size = Vector3.new(0.5, 1.2, 0.5) * scale,
+				Material = Enum.Material.Glass,
+				Color = Color3.fromRGB(150, 90, 230),
+				Transparency = 0.25,
+			}))
+			table.insert(specs, { radius = 2.6 * scale, angle = i / 6 * math.pi * 2, speed = 0.6, tilt = 0, bob = 0.6 * scale, spin = true })
+		end
+	elseif aura == "Godly" then
+		for ring = 1, 2 do
+			for i = 1, 18 do
+				table.insert(parts, effectPart({
+					Shape = Enum.PartType.Ball,
+					Size = Vector3.one * 0.3 * scale,
+					Material = Enum.Material.Neon,
+					Color = ring == 1 and Color3.fromRGB(190, 160, 255) or Color3.fromRGB(150, 220, 240),
+					Transparency = 0.5,
+				}))
+				table.insert(specs, {
+					radius = (ring == 1 and 3 or 3.6) * scale,
+					angle = i / 18 * math.pi * 2,
+					speed = ring == 1 and 0.35 or -0.25,
+					tilt = math.rad(ring == 1 and 20 or -30),
+				})
+			end
+		end
+	end
+	return parts, specs
+end
+
+local function clearOrbiters(other)
+	local o = orbiters[other]
+	if o then
+		for _, part in ipairs(o.parts) do
+			part:Destroy()
+		end
+		orbiters[other] = nil
+	end
+end
+
+RunService.RenderStepped:Connect(function(dt)
+	for _, other in ipairs(Players:GetPlayers()) do
+		local character = other.Character
+		local root = character and character:FindFirstChild("HumanoidRootPart")
+		local tier = Tiers[other:GetAttribute("HeightTier") or 0]
+		local aura = root and tier and tier.aura
+		local scale = character and character:GetScale() or 1
+		local o = orbiters[other]
+		if o and (o.character ~= character or o.aura ~= aura or math.abs(o.scale - scale) > 0.01) then
+			clearOrbiters(other)
+			o = nil
+		end
+		if not o and (aura == "Void" or aura == "Godly") then
+			local parts, specs = buildOrbiters(aura, scale)
+			o = { character = character, aura = aura, scale = scale, parts = parts, specs = specs, t = 0 }
+			orbiters[other] = o
+		end
+		if o and root then
+			o.t += dt
+			for i, part in ipairs(o.parts) do
+				local spec = o.specs[i]
+				local a = spec.angle + o.t * spec.speed
+				local offset = CFrame.Angles(spec.tilt, 0, 0) * Vector3.new(math.cos(a) * spec.radius, 0, math.sin(a) * spec.radius)
+				if spec.bob then
+					offset += Vector3.new(0, math.sin(o.t * 1.5 + spec.angle) * spec.bob, 0)
+				end
+				local turn = spec.spin and CFrame.Angles(o.t, o.t * 0.7, 0) or CFrame.identity
+				part.CFrame = CFrame.new(root.Position + offset) * turn
+			end
+		end
+	end
+end)
+Players.PlayerRemoving:Connect(clearOrbiters)
+
+-- An expanding, fading ring on the ground under a god-tier footstep.
+local function spawnShockwave(root, humanoid, scale)
+	local groundY = root.Position.Y - root.Size.Y / 2 - humanoid.HipHeight
+	local ring = effectPart({
+		Shape = Enum.PartType.Cylinder,
+		Size = Vector3.new(0.4, scale * 0.5, scale * 0.5),
+		CFrame = CFrame.new(root.Position.X, groundY + 0.5, root.Position.Z) * CFrame.Angles(0, 0, math.rad(90)),
+		Material = Enum.Material.Neon,
+		Color = Color3.fromRGB(200, 170, 255),
+		Transparency = 0.5,
+	})
+	tween(ring, 1.2, { Size = Vector3.new(0.4, scale * 10, scale * 10), Transparency = 1 })
+	task.delay(1.3, ring.Destroy, ring)
+end
+
+---------------------------------------------------------------------
 -- GIANT FOOTSTEPS: characters 10x+ thud and shake the camera of anyone near
 ---------------------------------------------------------------------
 local stepTimers = {} -- [player] = seconds since that giant's last step
@@ -472,6 +587,9 @@ RunService.Heartbeat:Connect(function(dt)
 			local t = (stepTimers[other] or interval) + dt
 			if t >= interval then
 				t = 0
+				if scale >= SHOCKWAVE_MIN_SCALE then
+					spawnShockwave(root, humanoid, scale)
+				end
 				local range = scale * 12
 				local distance = (root.Position - myRoot.Position).Magnitude
 				if distance < range then
@@ -657,9 +775,28 @@ local function setAuto(on)
 	end)
 end
 
+-- AUTO needs the Auto Roll pass. Without it, clicking opens the purchase prompt
+-- (in Studio the server just switches the pass on for testing).
+local function refreshAutoLock()
+	if player:GetAttribute("Pass_AutoRoll") then
+		if not autoOn then
+			autoButton.Text = "AUTO\nOFF"
+		end
+	else
+		setAuto(false)
+		autoButton.Text = "AUTO\nLOCKED"
+	end
+end
+
 autoButton.Activated:Connect(function()
+	if not autoOn and not player:GetAttribute("Pass_AutoRoll") then
+		shopRequest:FireServer("AutoRoll")
+		return
+	end
 	setAuto(not autoOn)
 end)
+player:GetAttributeChangedSignal("Pass_AutoRoll"):Connect(refreshAutoLock)
+refreshAutoLock()
 
 ---------------------------------------------------------------------
 -- LUCK BADGE
@@ -891,8 +1028,20 @@ local function showToast(text, color)
 end
 notify.OnClientEvent:Connect(showToast)
 
+-- Crush Pit: a giant's foot launched us. No damage, just a bounce.
+bounce.OnClientEvent:Connect(function(velocity)
+	local character = player.Character
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if root and humanoid then
+		humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+		root.AssemblyLinearVelocity = velocity
+		shake(0.3, 0.6)
+	end
+end)
+
 ---------------------------------------------------------------------
--- GAMBLER'S WHEEL button (the physical wheel near spawn has a prompt too)
+-- GROWTH SPINNER button (the physical spinner near spawn has a prompt too)
 ---------------------------------------------------------------------
 local wheelButton = make("TextButton", {
 	AnchorPoint = Vector2.new(0, 0.5),
@@ -908,7 +1057,7 @@ local wheelButton = make("TextButton", {
 
 local function refreshWheelButton()
 	local cost = remotes:GetAttribute("EssencePerSpin") or 50
-	wheelButton.Text = ("SPIN WHEEL\n%d/%d"):format(player:GetAttribute("Essence") or 0, cost)
+	wheelButton.Text = ("SPINNER\n%d/%d"):format(player:GetAttribute("Essence") or 0, cost)
 end
 wheelButton.Activated:Connect(function()
 	spinWheel:FireServer()
@@ -920,9 +1069,10 @@ refreshWheelButton()
 -- SHOP: gamepasses (in Studio the button just toggles a pass for testing)
 ---------------------------------------------------------------------
 local PASSES = {
+	{ key = "AutoRoll", name = "Auto Roll", desc = "Unlocks the AUTO button: rolls for you every 1.5s.", color = Color3.fromRGB(80, 200, 160) },
 	{ key = "Luck2x", name = "2x Luck", desc = "Permanently doubles your luck.", color = Color3.fromRGB(80, 220, 120) },
-	{ key = "FastRoll", name = "Fast Roll", desc = "Rolls spin in 0.4s. Auto-roll goes 3x faster.", color = Color3.fromRGB(80, 170, 255) },
-	{ key = "VIP", name = "VIP", desc = "+25% luck and a golden VIP tag over your head and in chat.", color = Color3.fromRGB(255, 215, 0) },
+	{ key = "FastRoll", name = "Fast Roll", desc = "0.4s roll cooldown and spin. Auto-roll goes 3x faster.", color = Color3.fromRGB(80, 170, 255) },
+	{ key = "VIP", name = "VIP Rank", desc = "+25% luck and a golden VIP tag over your head and in chat.", color = Color3.fromRGB(255, 215, 0) },
 }
 local IS_STUDIO = RunService:IsStudio()
 
